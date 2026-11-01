@@ -9,27 +9,45 @@ from database import Task, UserState
 
 BAR_WIDTH = 10
 
+WELCOME_TEXT = (
+    "👋 <b>Daily Routine bot</b>\n"
+    "Here is today's list - tap a task to tick it off.\n"
+    "All commands are in the <b>Menu</b> button next to the message box "
+    "(or send /help)."
+)
+
 HELP_TEXT = (
     "<b>Daily Routine bot</b>\n\n"
     "/tasks - today's checklist (tap a task to toggle it)\n"
     "/add &lt;text&gt; - add a task (or just /add and I'll ask)\n"
     "/delete - choose tasks to delete\n"
+    "/frequency - choose how often I remind you\n"
     "/reminders - turn the periodic reminders on/off\n"
     "/remind - send the reminder right now (preview)\n"
     "/timezone &lt;Area/City&gt; - set your timezone, e.g. Europe/Berlin\n"
     "/help - this message\n\n"
-    "Every night at midnight (your local time) a fresh list is generated. "
-    "Every few hours I remind you about what is still open."
+    "Every day a fresh list is generated. "
+    "In between I remind you about what is still open."
 )
 
 ADMIN_HELP_TEXT = (
     "\n\n<b>Admin</b>\n"
-    "/users - see who has access; approve, deny or revoke"
+    "/users - manage users"
 )
 
 
 def help_text(is_admin: bool) -> str:
     return HELP_TEXT + (ADMIN_HELP_TEXT if is_admin else "")
+
+
+def frequency_text(enabled: bool, interval: int) -> str:
+    """Message above the /frequency buttons."""
+    if not enabled:
+        status = "🔕 Reminders are <b>off</b>."
+    else:
+        every = "hour" if interval == 1 else f"{interval} hours"
+        status = f"🔔 I remind you every <b>{every}</b>."
+    return f"{status}\n\nHow often should I remind you about open tasks?"
 
 
 STATUS_ICONS = {"approved": "✅", "pending": "⏳", "denied": "❌", "revoked": "🚫"}

@@ -22,19 +22,24 @@ from access import AccessMiddleware
 from config import Config, parse_timezone, resolve_timezone
 from database import Database
 from keyboards import (
+    FREQ_OFF,
     VIEW_REMINDER,
     AccessCB,
+    FreqCB,
     TaskCB,
     delete_keyboard,
+    frequency_keyboard,
     reminder_keyboard,
     tasks_keyboard,
     users_keyboard,
 )
 from reminders import ReminderAction, ReminderService, send_with_retry
 from texts import (
+    WELCOME_TEXT,
     congrats_text,
     dashboard_text,
     delete_text,
+    frequency_text,
     help_text,
     reminder_text,
     users_text,
@@ -111,7 +116,7 @@ async def safe_edit(
 # -------------------------------------------------------------------- commands
 async def cmd_start(message: Message, state: FSMContext, db: Database, config: Config) -> None:
     await state.clear()
-    await message.answer(help_text(message.chat.id == config.admin_chat_id))
+    await message.answer(WELCOME_TEXT)
     text, markup = render_list(db, config, message.chat.id)
     await message.answer(text, reply_markup=markup)
 
@@ -259,6 +264,45 @@ async def cmd_reminders(message: Message, state: FSMContext, db: Database) -> No
     await message.answer("🔔 Reminders are ON." if enabled else "🔕 Reminders are OFF.")
 
 
+MAX_CUSTOM_INTERVAL = 12
+
+
+def render_frequency(
+    db: Database, config: Config, chat_id: int
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """The /frequency panel for the chat's current setting."""
+    state = db.get_state(chat_id)
+    interval = state.reminder_interval_hours or config.reminder_interval_hours
+    current = interval if state.reminders_enabled else FREQ_OFF
+    return frequency_text(state.reminders_enabled, interval), frequency_keyboard(current)
+
+
+async def cmd_frequency(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    db: Database,
+    config: Config,
+) -> None:
+    """``/frequency`` shows buttons; ``/frequency 3`` sets "every 3 hours" directly."""
+    await state.clear()
+    if command.args:
+        try:
+            hours = int(command.args.strip())
+            if not 1 <= hours <= MAX_CUSTOM_INTERVAL:
+                raise ValueError
+        except ValueError:
+            await message.answer(
+                f"⚠️ Give a whole number of hours from 1 to {MAX_CUSTOM_INTERVAL}, "
+                "e.g. <code>/frequency 3</code> - or use /frequency for buttons."
+            )
+            return
+        db.set_reminder_interval(message.chat.id, hours)
+        db.set_reminders_enabled(message.chat.id, True)
+    text, markup = render_frequency(db, config, message.chat.id)
+    await message.answer(text, reply_markup=markup)
+
+
 async def cmd_remind(
     message: Message, state: FSMContext, reminder_service: ReminderService
 ) -> None:
@@ -305,6 +349,29 @@ async def cb_delete(
     removed = db.delete_task(message.chat.id, callback_data.task_id, today)
     await callback.answer("🗑 Deleted" if removed else "Already gone")
     text, markup = render_delete(db, config, message.chat.id)
+    await safe_edit(message, text, markup)
+
+
+async def cb_frequency(
+    callback: CallbackQuery, callback_data: FreqCB, db: Database, config: Config
+) -> None:
+    """A frequency button (or "Off") was tapped."""
+    message = callback.message
+    if not isinstance(message, Message):
+        await callback.answer()
+        return
+    chat_id = message.chat.id
+    if callback_data.hours == FREQ_OFF:
+        db.set_reminders_enabled(chat_id, False)
+        await callback.answer("🔕 Reminders off")
+    elif 1 <= callback_data.hours <= 24:
+        db.set_reminder_interval(chat_id, callback_data.hours)
+        db.set_reminders_enabled(chat_id, True)
+        await callback.answer(f"🔔 Every {callback_data.hours}h")
+    else:
+        await callback.answer("Unknown option.")
+        return
+    text, markup = render_frequency(db, config, chat_id)
     await safe_edit(message, text, markup)
 
 
@@ -355,10 +422,12 @@ def build_router(config: Config) -> Router:
     router.message.register(cmd_add, Command("add"))
     router.message.register(cmd_cancel, Command("cancel"))
     router.message.register(cmd_delete, Command("delete"))
+    router.message.register(cmd_frequency, Command("frequency"))
     router.message.register(cmd_reminders, Command("reminders"))
     router.message.register(cmd_remind, Command("remind"))
     router.message.register(add_title, AddTask.waiting_for_title, F.text, ~F.text.startswith("/"))
 
+    router.callback_query.register(cb_frequency, FreqCB.filter())
     router.callback_query.register(cb_toggle, TaskCB.filter(F.action == "toggle"))
     router.callback_query.register(cb_delete, TaskCB.filter(F.action == "delete"))
     router.callback_query.register(cb_add, TaskCB.filter(F.action == "add"))

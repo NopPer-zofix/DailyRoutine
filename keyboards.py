@@ -11,6 +11,10 @@ from database import Task, UserState
 
 MAX_BUTTON_TITLE = 40
 
+# Reminder frequencies offered as buttons (hours between reminders).
+FREQUENCY_CHOICES = (1, 2, 3, 4, 6, 8, 12)
+FREQ_OFF = 0
+
 # Which message a callback came from, so we know how to re-render it.
 VIEW_LIST = "l"
 VIEW_REMINDER = "r"
@@ -33,6 +37,12 @@ class AccessCB(CallbackData, prefix="acc"):
 
     action: str
     chat_id: int
+
+
+class FreqCB(CallbackData, prefix="freq"):
+    """Reminder-frequency buttons. ``hours`` is the interval, or 0 for "off"."""
+
+    hours: int
 
 
 def _short(title: str) -> str:
@@ -139,4 +149,20 @@ def reminder_keyboard(tasks: Sequence[Task]) -> InlineKeyboardMarkup:
             )
         )
     kb.row(InlineKeyboardButton(text="📋 Full list", callback_data=TaskCB(action="list").pack()))
+    return kb.as_markup()
+
+
+def frequency_keyboard(current: int) -> InlineKeyboardMarkup:
+    """Pick how often reminders arrive; ``current`` (hours, 0 = off) is ticked."""
+    kb = InlineKeyboardBuilder()
+
+    def button(text: str, hours: int) -> InlineKeyboardButton:
+        mark = "✔ " if hours == current else ""
+        return InlineKeyboardButton(
+            text=f"{mark}{text}", callback_data=FreqCB(hours=hours).pack()
+        )
+
+    kb.row(*(button(f"{h}h", h) for h in FREQUENCY_CHOICES[:4]))
+    kb.row(*(button(f"{h}h", h) for h in FREQUENCY_CHOICES[4:]))
+    kb.row(button("🔕 Off", FREQ_OFF))
     return kb.as_markup()

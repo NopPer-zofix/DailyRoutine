@@ -28,5 +28,6 @@ CREATE TABLE IF NOT EXISTS user_state (
     last_rollover_date  TEXT,                             -- day tasks were last generated for
     last_congrats_date  TEXT,                             -- day the "all done" message was sent
     last_reminder_at    TEXT,                             -- ISO timestamp of the last reminder
-    reminders_enabled   INTEGER NOT NULL DEFAULT 1 CHECK (reminders_enabled IN (0, 1))
+    reminders_enabled   INTEGER NOT NULL DEFAULT 1 CHECK (reminders_enabled IN (0, 1)),
+    reminder_interval_hours INTEGER                       -- hours between reminders; NULL = server default
 );

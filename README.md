@@ -1,7 +1,7 @@
 # Daily Routine Telegram Bot
 
 A personal Telegram bot for a Raspberry Pi that tracks today's routine tasks and
-nudges you every 4 hours about whatever is still open.
+nudges you about whatever is still open - every 4 hours by default, or as often as you choose.
 
 - **Stack:** Python 3.10+, aiogram 3, APScheduler 3, SQLite, python-dotenv
 - **Invite-only, multi-user:** `ADMIN_CHAT_ID` is the owner and is always allowed. Anyone else who
@@ -15,8 +15,8 @@ nudges you every 4 hours about whatever is still open.
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Tasks          | `/add <text>`, ➕ button, 🗑 delete mode, `/tasks` checklist                                                                                                                                                                                      |
 | UI             | Tap a task to toggle ⬜ ↔ ✅; header shows `███░░░░░░░ 3/10 tasks completed (30%)`                                                                                                                                                                |
-| Midnight reset | At 00:00 **local** time a fresh list is generated (`ROLLOVER_MODE=reset` copies every task as not-done; `carry` copies only unfinished ones). It also runs lazily on first use and at startup, so a Pi that was off at midnight is still correct. |
-| 4-hour rule    | At 08:00, 12:00, 16:00, 20:00 (configurable) the bot checks completion. Open tasks → reminder with one-tap ✅ buttons. All done → no reminder, one short 🎉 message per day.                                                                      |
+| Midnight reset | At 00:00 **local** time a fresh list is generated and posted silently (no notification sound; skipped if reminders are off or the list is empty) (`ROLLOVER_MODE=reset` copies every task as not-done; `carry` copies only unfinished ones). It also runs lazily on first use and at startup, so a Pi that was off at midnight is still correct. |
+| Reminders      | At 08:00, 12:00, 16:00, 20:00 by default the bot checks completion. **Each user picks their own frequency** (1-12 h, or off) with `/frequency`; the schedule restarts from the first hour every day. Open tasks → reminder with one-tap ✅ buttons. All done → no reminder, one short 🎉 message per day.                                                                      |
 | Reliability    | Local timezone, send retries with backoff, flood-wait handling, reconnecting polling loop, graceful SIGINT/SIGTERM shutdown.                                                                                                                      |
 
 ## Project structure
@@ -30,13 +30,14 @@ DailyRoutine/
 ├── handlers.py              # commands + inline-button callbacks (admin-only router)
 ├── keyboards.py             # inline keyboards + typed callback data
 ├── texts.py                 # message rendering (progress bar, reminder text)
+├── menu.py                  # Telegram command menu (the Menu button)
 ├── access.py                # middleware: admin / approved users in, strangers request access
 ├── reminders.py             # 4-hour rule, per-user-timezone scheduler tick, retrying sender
 ├── daily-routine-bot.service# systemd unit
 ├── .env.example
 ├── requirements.txt / requirements-dev.txt
 ├── pytest.ini
-└── tests/                   # offline pytest suite (113 tests)
+└── tests/                   # offline pytest suite (130 tests)
 ```
 
 ## Database schema
@@ -58,7 +59,8 @@ CREATE TABLE user_state (
     last_rollover_date TEXT,                    -- makes rollover idempotent
     last_congrats_date TEXT,                    -- "all done" message once per day
     last_reminder_at TEXT,
-    reminders_enabled INTEGER NOT NULL DEFAULT 1
+    reminders_enabled INTEGER NOT NULL DEFAULT 1,
+    reminder_interval_hours INTEGER             -- per-user /frequency; NULL = REMINDER_INTERVAL_HOURS
 );
 ```
 
@@ -143,7 +145,7 @@ sqlite3 data/routine.db ".backup 'routine-backup.db'"
 | `ADMIN_CHAT_ID`                             | - (required)      | The owner: always allowed, approves other users                                                 |
 | `TIMEZONE`                                  | system zone       | IANA name, e.g. `Europe/Berlin`                                                        |
 | `DB_PATH`                                   | `data/routine.db` | SQLite file                                                                            |
-| `REMINDER_INTERVAL_HOURS`                   | `4`               | Hours between checks                                                                   |
+| `REMINDER_INTERVAL_HOURS`                   | `4`               | Default hours between checks (users can override with `/frequency`)                                                                   |
 | `REMINDER_START_HOUR` / `REMINDER_END_HOUR` | `8` / `22`        | Checks fire at start, start+N, ... ≤ end (local hours), so nothing wakes you at 4 a.m. |
 | `ROLLOVER_MODE`                             | `reset`           | `reset` or `carry` (see above)                                                         |
 | `SEND_CONGRATS`                             | `true`            | One 🎉 message when everything is done                                                 |
@@ -170,7 +172,7 @@ Notes:
 
 ## Bot commands
 
-`/tasks` · `/add <text>` · `/delete` · `/reminders` (toggle on/off) · `/remind` (send the reminder now - a preview that ignores the schedule and changes no state) · `/timezone <Area/City>` · `/cancel` · `/help` · admin only: `/users`
+`/tasks` · `/add <text>` · `/delete` · `/frequency [hours]` (buttons, or e.g. `/frequency 3`) · `/reminders` (toggle on/off) · `/remind` (send the reminder now - a preview that ignores the schedule and changes no state) · `/timezone <Area/City>` · `/cancel` · `/help` · admin only: `/users`. All of these appear in the bot's **Menu** button (registered on startup); `/start` no longer lists them.
 
 ## Tests
 

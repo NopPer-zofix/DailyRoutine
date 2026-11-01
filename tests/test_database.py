@@ -272,3 +272,41 @@ def test_old_database_is_migrated_and_keeps_admin_approved(tmp_path):
     assert database.list_chats() == [330122144]
     assert database.list_tasks(330122144, TODAY)[0].title == "Gym"
     database.close()
+
+
+def test_reminder_interval_roundtrip_and_validation(db: Database):
+    assert db.get_state(1).reminder_interval_hours is None  # unset = server default
+
+    db.set_reminder_interval(1, 3)
+    assert db.get_state(1).reminder_interval_hours == 3
+
+    db.set_reminder_interval(1, None)
+    assert db.get_state(1).reminder_interval_hours is None
+
+    for bad in (0, 25):
+        with pytest.raises(ValueError):
+            db.set_reminder_interval(1, bad)
+
+
+def test_old_database_gains_interval_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        "CREATE TABLE user_state (chat_id INTEGER PRIMARY KEY, last_rollover_date TEXT,"
+        " last_congrats_date TEXT, last_reminder_at TEXT,"
+        " reminders_enabled INTEGER NOT NULL DEFAULT 1);"
+        "INSERT INTO user_state (chat_id) VALUES (5);"
+    )
+    old.commit()
+    old.close()
+
+    database = Database(path)
+    database.connect()
+    try:
+        assert database.get_state(5).reminder_interval_hours is None
+        database.set_reminder_interval(5, 2)
+        assert database.get_state(5).reminder_interval_hours == 2
+    finally:
+        database.close()

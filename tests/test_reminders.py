@@ -194,7 +194,9 @@ async def test_tick_rolls_over_at_users_local_midnight(bot, db, config):
     await _service_at(bot, db, config, NOW).tick()
 
     assert [t.title for t in db.list_tasks(CHAT, TODAY.replace(day=11))] == ["Gym"]
-    bot.send_message.assert_not_awaited()  # hour 0 is not a reminder hour
+    # The fresh list is posted - silently, it is midnight.
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.call_args.kwargs["disable_notification"] is True
 
 
 async def test_unapproved_chats_get_no_reminders(bot, db, config):
@@ -273,3 +275,67 @@ async def test_send_does_not_retry_when_bot_is_blocked(bot):
 
     assert await send_with_retry(bot, CHAT, "hi") is None
     assert bot.send_message.await_count == 1
+
+
+# ------------------------------------------------ per-user reminder frequency
+async def test_tick_uses_the_users_own_interval(bot, db, config):
+    db.ensure_chat(CHAT)
+    db.add_task(CHAT, "Gym", TODAY)
+    db.set_reminder_interval(CHAT, 3)  # 8, 11, 14, 17, 20
+
+    await _service_at(bot, db, config, NOW).tick()  # 12:00 - fits the default, not every-3h
+    bot.send_message.assert_not_awaited()
+
+    await _service_at(bot, db, config, NOW.replace(hour=14)).tick()
+    bot.send_message.assert_awaited_once()
+
+
+async def test_hourly_interval_reminds_every_hour(bot, db, config):
+    db.ensure_chat(CHAT)
+    db.add_task(CHAT, "Gym", TODAY)
+    db.set_reminder_interval(CHAT, 1)
+
+    await _service_at(bot, db, config, NOW.replace(hour=13)).tick()
+
+    bot.send_message.assert_awaited_once()
+
+
+def test_hours_for_falls_back_to_server_default(service):
+    assert service.hours_for(None) == [8, 12, 16, 20]
+    assert service.hours_for(6) == [8, 14, 20]
+
+
+# ------------------------------------------------------------ midnight refresh
+MIDNIGHT = NOW.replace(day=11, hour=0, minute=2)  # Berlin, start of the 11th
+
+
+async def test_midnight_posts_fresh_list_once(bot, db, config):
+    db.ensure_chat(CHAT)
+    task = db.add_task(CHAT, "Gym", TODAY)
+    db.toggle_task(CHAT, task.id, TODAY, NOW)
+
+    service = _service_at(bot, db, config, MIDNIGHT)
+    await service.tick()
+    await service.tick()  # same slot again (e.g. restart): no duplicate
+
+    bot.send_message.assert_awaited_once()
+    assert "0/1" in bot.send_message.call_args.args[1]  # reset mode: new day starts unticked
+
+
+async def test_midnight_list_is_skipped_when_reminders_are_off(bot, db, config):
+    db.ensure_chat(CHAT)
+    db.add_task(CHAT, "Gym", TODAY)
+    db.set_reminders_enabled(CHAT, False)
+
+    await _service_at(bot, db, config, MIDNIGHT).tick()
+
+    bot.send_message.assert_not_awaited()
+    assert db.progress(CHAT, MIDNIGHT.date()) == (0, 1)  # but the list is still rolled over
+
+
+async def test_midnight_without_tasks_sends_nothing(bot, db, config):
+    db.ensure_chat(CHAT)
+
+    await _service_at(bot, db, config, MIDNIGHT).tick()
+
+    bot.send_message.assert_not_awaited()

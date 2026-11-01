@@ -17,6 +17,7 @@ from aiohttp import ClientError
 from config import Config, ConfigError, load_config
 from database import Database
 from handlers import build_router
+from menu import setup_menu
 from reminders import ReminderService
 
 log = logging.getLogger("routine")
@@ -89,6 +90,7 @@ async def run(config: Config) -> None:
     install_signal_handlers(asyncio.get_running_loop(), stop)
 
     scheduler.start()
+    await setup_menu(bot, config.admin_chat_id)
     await service.rollover_all()  # catch up if the bot was down at midnight
     log.info("Bot started (timezone: %s)", config.tz)
 

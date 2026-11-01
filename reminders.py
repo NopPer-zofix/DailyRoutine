@@ -1,4 +1,4 @@
-"""Scheduled jobs: midnight rollover and the 4-hour reminder check."""
+"""Scheduled jobs: midnight rollover and the periodic reminder check."""
 from __future__ import annotations
 
 import asyncio
@@ -20,8 +20,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from config import Config, resolve_timezone
 from database import Database
-from keyboards import reminder_keyboard
-from texts import congrats_text, reminder_text
+from keyboards import reminder_keyboard, tasks_keyboard
+from texts import congrats_text, dashboard_text, reminder_text
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def decide_reminder(
     congratulated_today: bool = False,
     send_congrats: bool = True,
 ) -> ReminderAction:
-    """The 4-hour rule as a pure function.
+    """The reminder rule as a pure function.
 
     * reminders switched off, or no tasks at all -> nothing
     * unfinished tasks remain -> remind
@@ -74,6 +74,7 @@ async def send_with_retry(
     *,
     attempts: int = 5,
     base_delay: float = 2.0,
+    disable_notification: bool = False,
 ) -> Optional[Message]:
     """Send a message, riding out flaky internet and Telegram flood limits.
 
@@ -84,7 +85,12 @@ async def send_with_retry(
     """
     for attempt in range(1, attempts + 1):
         try:
-            return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+            return await bot.send_message(
+                chat_id,
+                text,
+                reply_markup=reply_markup,
+                disable_notification=disable_notification,
+            )
         except TelegramRetryAfter as exc:
             log.warning("Flood control, sleeping %ss", exc.retry_after)
             await asyncio.sleep(exc.retry_after + 1)
@@ -130,6 +136,14 @@ class ReminderService:
     def now(self, tz: tzinfo) -> datetime:
         return self._now_fn(tz)
 
+    def hours_for(self, interval: Optional[int]) -> List[int]:
+        """Reminder hours for a user's own interval (None = server default)."""
+        if interval is None:
+            return self.hours
+        return reminder_hours(
+            self.config.reminder_start_hour, self.config.reminder_end_hour, interval
+        )
+
     def tz_for(self, chat_id: int) -> tzinfo:
         """The chat's own timezone, falling back to the server default."""
         return resolve_timezone(self.db.get_state(chat_id).timezone, self.config.tz)
@@ -151,23 +165,50 @@ class ReminderService:
         At the top of a local hour (minute < 15, i.e. the first tick of the
         hour - every real timezone offset is a multiple of 15 minutes):
 
-        * local hour 0 -> roll the user's tasks over to the new day;
-        * local hour in the reminder hours -> apply the 4-hour rule.
+        * local hour 0 -> roll the user's tasks over to the new day and, if
+          reminders are on, post the fresh list (silently - it is midnight);
+        * local hour in the user's reminder hours (their own interval, or the
+          server default) -> apply the reminder rule.
         """
         for chat_id in self.db.list_chats():
             try:
-                local = self.now(self.tz_for(chat_id))
+                state = self.db.get_state(chat_id)
+                local = self.now(resolve_timezone(state.timezone, self.config.tz))
                 if local.minute >= TICK_MINUTES:
                     continue
+                announced = False
                 if local.hour == 0:
-                    self.db.roll_over(chat_id, local.date(), self.config.rollover_mode)
-                if local.hour in self.hours:
+                    announced = await self._new_day(chat_id, local, state.reminders_enabled)
+                if not announced and local.hour in self.hours_for(state.reminder_interval_hours):
                     await self.process_chat(chat_id)
             except Exception:
                 log.exception("Scheduled check failed for chat %s", chat_id)
 
+    async def _new_day(self, chat_id: int, local: datetime, announce: bool) -> bool:
+        """Midnight: generate today's list and (optionally) show it.
+
+        Returns True if the fresh list was sent (it then stands in for a
+        reminder at the same hour).
+        """
+        today = local.date()
+        first = self.db.get_state(chat_id).last_rollover_date != today
+        self.db.roll_over(chat_id, today, self.config.rollover_mode)
+        if not (announce and first):  # once per day, even if the bot restarts
+            return False
+        tasks = self.db.list_tasks(chat_id, today)
+        if not tasks:
+            return False
+        sent = await send_with_retry(
+            self.bot,
+            chat_id,
+            dashboard_text(tasks, today),
+            tasks_keyboard(tasks),
+            disable_notification=True,
+        )
+        return sent is not None
+
     async def process_chat(self, chat_id: int, *, force: bool = False) -> ReminderAction:
-        """Evaluate the 4-hour rule for one chat and act on it.
+        """Evaluate the reminder rule for one chat and act on it.
 
         Args:
             chat_id: Chat to process.

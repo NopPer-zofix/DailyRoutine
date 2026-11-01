@@ -26,6 +26,7 @@ _MIGRATIONS = {
     "status": "TEXT NOT NULL DEFAULT 'approved'",
     "display_name": "TEXT",
     "timezone": "TEXT",
+    "reminder_interval_hours": "INTEGER",
 }
 
 
@@ -53,6 +54,7 @@ class UserState:
     status: str = "approved"
     timezone: Optional[str] = None
     display_name: Optional[str] = None
+    reminder_interval_hours: Optional[int] = None  # None = server default
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:
@@ -221,6 +223,17 @@ class Database:
             status=row["status"],
             timezone=row["timezone"],
             display_name=row["display_name"],
+            reminder_interval_hours=row["reminder_interval_hours"],
+        )
+
+    def set_reminder_interval(self, chat_id: int, hours: Optional[int]) -> None:
+        """Store how many hours pass between reminders (None = server default)."""
+        if hours is not None and not 1 <= hours <= 24:
+            raise ValueError("Reminder interval must be between 1 and 24 hours")
+        self._touch(chat_id)
+        self.conn.execute(
+            "UPDATE user_state SET reminder_interval_hours = ? WHERE chat_id = ?",
+            (hours, chat_id),
         )
 
     def set_reminders_enabled(self, chat_id: int, enabled: bool) -> None:

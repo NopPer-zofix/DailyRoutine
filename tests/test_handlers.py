@@ -8,7 +8,7 @@ import handlers
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandObject
 from handlers import AddTask
-from keyboards import VIEW_REMINDER, TaskCB
+from keyboards import FREQ_OFF, VIEW_REMINDER, FreqCB, TaskCB
 from reminders import ReminderAction
 from tests.conftest import CHAT, NOW, TODAY
 
@@ -216,3 +216,112 @@ async def test_add_button_enters_waiting_state(make_callback, fsm):
     cb.message.answer.assert_awaited_once()
 
 
+# ------------------------------------------------------------------ frequency
+def _freq(args):
+    return CommandObject(prefix="/", command="frequency", args=args)
+
+
+def _ticked(markup):
+    return [b.text for b in _buttons(markup) if b.text.startswith("✔")]
+
+
+async def test_start_greets_briefly_instead_of_listing_every_command(make_message, fsm, db, config):
+    msg = make_message()
+
+    await handlers.cmd_start(msg, fsm, db, config)
+
+    welcome = msg.answer.call_args_list[0].args[0]
+    assert "Menu" in welcome
+    assert "/timezone" not in welcome and "/delete" not in welcome
+    assert len(msg.answer.call_args_list) == 2  # welcome + today's list
+
+
+async def test_help_still_lists_commands_on_request(make_message, fsm, config):
+    msg = make_message()
+
+    await handlers.cmd_help(msg, fsm, config)
+
+    text = msg.answer.call_args.args[0]
+    assert "/frequency" in text and "/users" in text  # CHAT is the admin
+
+
+async def test_frequency_shows_buttons_with_default_ticked(make_message, fsm, db, config):
+    msg = make_message()
+
+    await handlers.cmd_frequency(msg, _freq(None), fsm, db, config)
+
+    assert _ticked(msg.answer.call_args.kwargs["reply_markup"]) == ["✔ 4h"]  # config default
+    assert "every <b>4 hours</b>" in msg.answer.call_args.args[0]
+
+
+async def test_frequency_argument_sets_interval_and_enables(make_message, fsm, db, config):
+    db.set_reminders_enabled(CHAT, False)
+    msg = make_message()
+
+    await handlers.cmd_frequency(msg, _freq("2"), fsm, db, config)
+
+    state = db.get_state(CHAT)
+    assert state.reminder_interval_hours == 2 and state.reminders_enabled is True
+
+
+async def test_frequency_rejects_nonsense(make_message, fsm, db, config):
+    msg = make_message()
+
+    for bad in ("0", "13", "often", "1.5"):
+        await handlers.cmd_frequency(msg, _freq(bad), fsm, db, config)
+        assert "whole number" in msg.answer.call_args.args[0]
+
+    assert db.get_state(CHAT).reminder_interval_hours is None
+
+
+async def test_frequency_buttons_set_interval_and_off(make_callback, db, config):
+    cb = make_callback()
+
+    await handlers.cb_frequency(cb, FreqCB(hours=6), db, config)
+    assert db.get_state(CHAT).reminder_interval_hours == 6
+    assert db.get_state(CHAT).reminders_enabled is True
+    assert _ticked(cb.message.edit_text.call_args.kwargs["reply_markup"]) == ["✔ 6h"]
+
+    await handlers.cb_frequency(cb, FreqCB(hours=FREQ_OFF), db, config)
+    state = db.get_state(CHAT)
+    assert state.reminders_enabled is False and state.reminder_interval_hours == 6  # remembered
+    assert _ticked(cb.message.edit_text.call_args.kwargs["reply_markup"]) == ["✔ 🔕 Off"]
+
+
+async def test_frequency_callback_ignores_out_of_range(make_callback, db, config):
+    cb = make_callback()
+
+    await handlers.cb_frequency(cb, FreqCB(hours=99), db, config)
+
+    assert db.get_state(CHAT).reminder_interval_hours is None
+    cb.message.edit_text.assert_not_awaited()
+
+
+# ----------------------------------------------------------------- command menu
+async def test_menu_publishes_commands_and_adds_users_for_admin():
+    from aiogram.types import BotCommandScopeChat
+
+    from menu import ADMIN_COMMANDS, USER_COMMANDS, setup_menu
+
+    bot = MagicMock()
+    bot.set_my_commands = AsyncMock()
+
+    await setup_menu(bot, admin_chat_id=CHAT)
+
+    default_call, admin_call = bot.set_my_commands.await_args_list
+    assert default_call.args[0] == USER_COMMANDS
+    assert admin_call.args[0] == ADMIN_COMMANDS
+    assert admin_call.kwargs["scope"] == BotCommandScopeChat(chat_id=CHAT)
+    assert "users" not in [c.command for c in USER_COMMANDS]
+    assert "users" in [c.command for c in ADMIN_COMMANDS]
+
+
+async def test_menu_failure_does_not_crash_startup():
+    from aiogram.exceptions import TelegramNetworkError
+
+    from menu import setup_menu
+
+    bot = MagicMock()
+    bot.set_my_commands = AsyncMock(side_effect=TelegramNetworkError(MagicMock(), "offline"))
+
+    await setup_menu(bot, admin_chat_id=CHAT)  # must not raise
