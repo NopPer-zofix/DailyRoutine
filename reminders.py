@@ -55,7 +55,7 @@ def decide_reminder(
     if done < total:
         return ReminderAction.REMIND
     if send_congrats and not congratulated_today:
-        return ReminderAction.CONGRATS
+        return ReminderAction.NONE
     return ReminderAction.NONE
 
 

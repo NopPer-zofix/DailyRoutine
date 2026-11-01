@@ -58,18 +58,30 @@ def user_label(user: UserState) -> str:
 
 
 def users_text(users: Sequence[UserState], admin_chat_id: int) -> str:
-    """Admin overview of everybody the bot knows."""
+    """Admin overview of everybody the bot knows, numbered 1..n."""
     lines = []
-    for u in users:
+    for number, u in enumerate(users, start=1):
         if u.chat_id == admin_chat_id:
-            lines.append("👑 <b>You</b> (admin)")
+            lines.append(f"{number}. 👑 <b>You</b> (admin)")
             continue
         tz = f" · {escape(u.timezone)}" if u.timezone else ""
         lines.append(
-            f"{STATUS_ICONS.get(u.status, '•')} {user_label(u)} · <code>{u.chat_id}</code>"
-            f" · {u.status}{tz}"
+            f"{number}. {STATUS_ICONS.get(u.status, '•')} {user_label(u)} · "
+            f"<code>{u.chat_id}</code> · {u.status}{tz}"
         )
     return "👥 <b>Users</b>\n\n" + "\n".join(lines)
+
+
+USERS_PROMPT = "\n\nSend the <b>number</b> of the user you want to manage."
+
+
+def manage_user_text(user: UserState, number: int) -> str:
+    """The menu shown after the admin picked a number."""
+    return (
+        f"👤 <b>{number}. {user_label(user)}</b> · <code>{user.chat_id}</code>\n"
+        f"Status: {STATUS_ICONS.get(user.status, '•')} {user.status}\n\n"
+        "What should I do?"
+    )
 
 
 def access_request_text(display_name: str, chat_id: int) -> str:

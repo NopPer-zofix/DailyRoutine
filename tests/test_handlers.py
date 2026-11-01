@@ -135,7 +135,7 @@ async def test_remind_command_explains_when_there_are_no_tasks(make_message, fsm
 
     await handlers.cmd_remind(msg, fsm, service)
 
-    assert "nothing to remind" in msg.answer.call_args.args[0]
+    assert "Nothing to remind" in msg.answer.call_args.args[0]
 
 
 # ------------------------------------------------------------------ callbacks
@@ -325,3 +325,13 @@ async def test_menu_failure_does_not_crash_startup():
     bot.set_my_commands = AsyncMock(side_effect=TelegramNetworkError(MagicMock(), "offline"))
 
     await setup_menu(bot, admin_chat_id=CHAT)  # must not raise
+
+
+async def test_finishing_last_task_by_hand_suppresses_the_scheduled_congrats(
+    make_callback, db, config
+):
+    gym = db.add_task(CHAT, "Gym", TODAY)
+
+    await handlers.cb_toggle(make_callback(), TaskCB(action="toggle", task_id=gym.id), db, config)
+
+    assert db.get_state(CHAT).last_congrats_date == TODAY

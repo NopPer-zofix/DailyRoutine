@@ -29,7 +29,7 @@ from tests.conftest import CHAT, NOW, TODAY
     [
         (5, 2, {}, ReminderAction.REMIND),  # open tasks -> remind
         (5, 0, {}, ReminderAction.REMIND),
-        (5, 5, {}, ReminderAction.CONGRATS),  # all done -> congratulate once
+        (5, 5, {}, ReminderAction.NONE),  # all done -> stay quiet (no congratulation)
         (5, 5, {"congratulated_today": True}, ReminderAction.NONE),
         (5, 5, {"send_congrats": False}, ReminderAction.NONE),
         (0, 0, {}, ReminderAction.NONE),  # nothing planned -> stay quiet
@@ -76,15 +76,14 @@ async def test_open_tasks_trigger_reminder_with_buttons(service, bot, db):
     assert db.get_state(CHAT).last_reminder_at == NOW
 
 
-async def test_all_done_skips_reminder_and_congratulates_once(service, bot, db):
+async def test_all_done_sends_nothing_at_all(service, bot, db):
     task = db.add_task(CHAT, "Gym", TODAY)
     db.toggle_task(CHAT, task.id, TODAY, NOW)
 
-    assert await service.process_chat(CHAT) is ReminderAction.CONGRATS
-    assert await service.process_chat(CHAT) is ReminderAction.NONE  # not twice
+    assert await service.process_chat(CHAT) is ReminderAction.NONE
+    assert await service.process_chat(CHAT) is ReminderAction.NONE
 
-    assert bot.send_message.await_count == 1
-    assert "🎉" in bot.send_message.call_args.args[1]
+    bot.send_message.assert_not_awaited()
 
 
 async def test_no_message_when_reminders_disabled(service, bot, db):
@@ -105,14 +104,13 @@ async def test_forced_reminder_ignores_off_switch_and_records_nothing(service, b
     assert db.get_state(CHAT).last_reminder_at is None  # preview leaves no trace
 
 
-async def test_forced_preview_when_all_done_does_not_use_up_daily_congrats(service, bot, db):
+async def test_forced_preview_when_all_done_sends_nothing(service, bot, db):
     task = db.add_task(CHAT, "Gym", TODAY)
     db.toggle_task(CHAT, task.id, TODAY, NOW)
 
-    assert await service.process_chat(CHAT, force=True) is ReminderAction.CONGRATS
-    assert await service.process_chat(CHAT, force=True) is ReminderAction.CONGRATS  # repeatable
-    assert db.get_state(CHAT).last_congrats_date is None
-    assert await service.process_chat(CHAT) is ReminderAction.CONGRATS  # real one still fires
+    assert await service.process_chat(CHAT, force=True) is ReminderAction.NONE
+
+    bot.send_message.assert_not_awaited()
 
 
 async def test_failed_send_is_not_recorded(service, bot, db, monkeypatch):
@@ -339,3 +337,21 @@ async def test_midnight_without_tasks_sends_nothing(bot, db, config):
     await _service_at(bot, db, config, MIDNIGHT).tick()
 
     bot.send_message.assert_not_awaited()
+
+
+async def test_nothing_is_sent_after_everything_is_done(bot, db, config):
+    """A whole day, reminders hourly: once all is done, the bot goes completely quiet."""
+    db.ensure_chat(CHAT)
+    db.set_reminder_interval(CHAT, 1)
+    db.add_task(CHAT, "Gym", TODAY)
+    done = db.add_task(CHAT, "Read", TODAY)
+    db.toggle_task(CHAT, done.id, TODAY, NOW)
+
+    gym = db.list_tasks(CHAT, TODAY)[0]
+    for hour in range(8, 23):  # open task -> reminded each hour until it is finished before 13:00
+        if hour == 13:
+            db.toggle_task(CHAT, gym.id, TODAY, NOW)
+        await _service_at(bot, db, config, NOW.replace(hour=hour, minute=0)).tick()
+
+    texts = [c.args[1] for c in bot.send_message.call_args_list]
+    assert len(texts) == 5 and all("Reminder" in t for t in texts)  # 8..12, then silence

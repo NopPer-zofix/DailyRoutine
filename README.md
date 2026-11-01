@@ -16,7 +16,7 @@ nudges you about whatever is still open - every 4 hours by default, or as often 
 | Tasks          | `/add <text>`, ➕ button, 🗑 delete mode, `/tasks` checklist                                                                                                                                                                                      |
 | UI             | Tap a task to toggle ⬜ ↔ ✅; header shows `███░░░░░░░ 3/10 tasks completed (30%)`                                                                                                                                                                |
 | Midnight reset | At 00:00 **local** time a fresh list is generated and posted silently (no notification sound; skipped if reminders are off or the list is empty) (`ROLLOVER_MODE=reset` copies every task as not-done; `carry` copies only unfinished ones). It also runs lazily on first use and at startup, so a Pi that was off at midnight is still correct. |
-| Reminders      | At 08:00, 12:00, 16:00, 20:00 by default the bot checks completion. **Each user picks their own frequency** (1-12 h, or off) with `/frequency`; the schedule restarts from the first hour every day. Open tasks → reminder with one-tap ✅ buttons. All done → no reminder, one short 🎉 message per day.                                                                      |
+| Reminders      | At 08:00, 12:00, 16:00, 20:00 by default the bot checks completion. **Each user picks their own frequency** (1-12 h, or off) with `/frequency`; the schedule restarts from the first hour every day. Open tasks → reminder with one-tap ✅ buttons. All done → nothing is sent.                                                                      |
 | Reliability    | Local timezone, send retries with backoff, flood-wait handling, reconnecting polling loop, graceful SIGINT/SIGTERM shutdown.                                                                                                                      |
 
 ## Project structure
@@ -148,14 +148,14 @@ sqlite3 data/routine.db ".backup 'routine-backup.db'"
 | `REMINDER_INTERVAL_HOURS`                   | `4`               | Default hours between checks (users can override with `/frequency`)                                                                   |
 | `REMINDER_START_HOUR` / `REMINDER_END_HOUR` | `8` / `22`        | Checks fire at start, start+N, ... ≤ end (local hours), so nothing wakes you at 4 a.m. |
 | `ROLLOVER_MODE`                             | `reset`           | `reset` or `carry` (see above)                                                         |
-| `SEND_CONGRATS`                             | `true`            | One 🎉 message when everything is done                                                 |
+| `SEND_CONGRATS`                             | `true`            | (currently unused - the all-done 🎉 message is switched off)                                                 |
 | `LOG_LEVEL`                                 | `INFO`            |                                                                                        |
 
 ## Access control
 
 | Who | What happens |
 |---|---|
-| Admin (`ADMIN_CHAT_ID`) | Always allowed. `/users` lists everyone with Approve / Deny / Revoke / Re-approve buttons. |
+| Admin (`ADMIN_CHAT_ID`) | Always allowed. `/users` shows a numbered list of everyone; send a number to open that user's menu (Revoke / Unban / Approve / Deny, or ✖ Cancel). |
 | New person | Their first message creates a *pending* request and sends the admin a notification with ✅ Approve / ❌ Deny. They are told to wait. Nothing is stored except their name and chat id. |
 | Approved | Full use of the bot; own private list, reminders, timezone. |
 | Pending | Told "still waiting"; the admin is not notified again. |

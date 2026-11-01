@@ -27,21 +27,26 @@ from keyboards import (
     AccessCB,
     FreqCB,
     TaskCB,
+    cancel_keyboard,
     delete_keyboard,
     frequency_keyboard,
+    manage_user_keyboard,
     reminder_keyboard,
     tasks_keyboard,
-    users_keyboard,
 )
 from reminders import ReminderAction, ReminderService, send_with_retry
 from texts import (
+    STATUS_ICONS,
+    USERS_PROMPT,
     WELCOME_TEXT,
     congrats_text,
     dashboard_text,
     delete_text,
     frequency_text,
     help_text,
+    manage_user_text,
     reminder_text,
+    user_label,
     users_text,
 )
 
@@ -158,15 +163,39 @@ async def cmd_timezone(
 
 
 # ---------------------------------------------------------------------- admin
-def render_users(db: Database, config: Config) -> Tuple[str, InlineKeyboardMarkup]:
-    users = db.list_users()
-    return users_text(users, config.admin_chat_id), users_keyboard(users, config.admin_chat_id)
+class ManageUser(StatesGroup):
+    """FSM: the admin's next plain-text message is the number of a user in /users."""
+
+    waiting_for_number = State()
 
 
 async def cmd_users(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    """Numbered list of everybody; then ask which one to manage."""
     await state.clear()
-    text, markup = render_users(db, config)
-    await message.answer(text, reply_markup=markup)
+    await state.set_state(ManageUser.waiting_for_number)
+    text = users_text(db.list_users(), config.admin_chat_id) + USERS_PROMPT
+    await message.answer(text, reply_markup=cancel_keyboard())
+
+
+async def users_pick(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    """The admin sent a number: show that user's status and the actions that fit it."""
+    users = db.list_users()  # fresh, so a request that arrived meanwhile is counted
+    raw = (message.text or "").strip().lstrip("#")
+    if not (raw.isascii() and raw.isdigit() and 1 <= int(raw) <= len(users)):
+        await message.answer(
+            f"⚠️ Send a number from 1 to {len(users)} (or /cancel).",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+    number = int(raw)
+    user = users[number - 1]
+    if user.chat_id == config.admin_chat_id:
+        await message.answer(
+            "That's you - pick another number (or /cancel).", reply_markup=cancel_keyboard()
+        )
+        return
+    await state.clear()  # the buttons below carry everything they need
+    await message.answer(manage_user_text(user, number), reply_markup=manage_user_keyboard(user))
 
 
 _ACCESS_ACTIONS = {"approve": "approved", "deny": "denied", "revoke": "revoked"}
@@ -180,11 +209,19 @@ _ACCESS_NOTICES = {
 async def cb_access(
     callback: CallbackQuery,
     callback_data: AccessCB,
+    state: FSMContext,
     bot: Bot,
     db: Database,
     config: Config,
 ) -> None:
-    """Admin pressed Approve / Deny / Revoke."""
+    """Admin pressed Approve / Deny / Revoke / Unban, or Cancel."""
+    if callback_data.action == "cancel":
+        await state.clear()
+        await callback.answer("Cancelled.")
+        if isinstance(callback.message, Message):
+            await safe_edit(callback.message, "Cancelled.", None)
+        return
+
     target = callback_data.chat_id
     new_status = _ACCESS_ACTIONS.get(callback_data.action)
     previous = db.get_status(target)
@@ -199,8 +236,13 @@ async def cb_access(
     await callback.answer(f"{new_status.capitalize()}.")
 
     if isinstance(callback.message, Message):
-        text, markup = render_users(db, config)
-        await safe_edit(callback.message, text, markup)
+        user = db.get_state(target)
+        await safe_edit(
+            callback.message,
+            f"{STATUS_ICONS.get(new_status, '•')} {user_label(user)} · "
+            f"<code>{target}</code> is now <b>{new_status}</b>.",
+            None,  # drop the buttons: the decision is made
+        )
 
 
 async def cmd_tasks(message: Message, state: FSMContext, db: Database, config: Config) -> None:
@@ -310,7 +352,7 @@ async def cmd_remind(
     await state.clear()
     action = await reminder_service.process_chat(message.chat.id, force=True)
     if action is ReminderAction.NONE:
-        await message.answer("No tasks today - nothing to remind about. Add one with /add.")
+        await message.answer("Nothing to remind you about - no open tasks. Add one with /add.")
     elif action is ReminderAction.CONGRATS:
         await message.answer("<i>(All tasks are done, so this is the all-done message.)</i>")
 
@@ -330,6 +372,10 @@ async def cb_toggle(
         await callback.answer("That task no longer exists - refreshed.")
     else:
         await callback.answer("✅ Done!" if task.is_done else "↩️ Marked as not done")
+        done, total = db.progress(message.chat.id, today)
+        if total and done == total:
+            # The user just saw the all-done state; don't send the scheduled 🎉 on top of it.
+            db.mark_congratulated(message.chat.id, today)
 
     if callback_data.view == VIEW_REMINDER:
         text, markup = render_reminder(db, config, message.chat.id)
@@ -413,6 +459,9 @@ def build_router(config: Config) -> Router:
     is_admin_cb = F.message.chat.id == config.admin_chat_id
 
     router.message.register(cmd_users, Command("users"), is_admin_msg)
+    router.message.register(
+        users_pick, ManageUser.waiting_for_number, is_admin_msg, F.text, ~F.text.startswith("/")
+    )
     router.callback_query.register(cb_access, AccessCB.filter(), is_admin_cb)
 
     router.message.register(cmd_start, CommandStart())

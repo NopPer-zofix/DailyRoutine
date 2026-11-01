@@ -4,7 +4,7 @@ from __future__ import annotations
 from aiogram.dispatcher.event.bases import UNHANDLED
 
 from database import MAX_PENDING_REQUESTS
-from keyboards import AccessCB, users_keyboard
+from keyboards import AccessCB, manage_user_keyboard
 from tests.conftest import CHAT, TODAY
 from texts import users_text
 
@@ -80,7 +80,8 @@ async def test_admin_approves_user(feed, db):
     assert db.get_status(STRANGER) == "approved"
     assert db.list_chats() == [CHAT, STRANGER] or STRANGER in db.list_chats()
     assert "given access" in fed.texts_to(STRANGER)[0]  # user is told
-    assert fed.calls("EditMessageText")  # admin's message becomes the /users view
+    [edit] = fed.calls("EditMessageText")  # the request message turns into a result line
+    assert "approved" in edit.text and edit.reply_markup is None
 
 
 async def test_admin_denies_user(feed, db):
@@ -186,18 +187,203 @@ async def test_user_cannot_toggle_another_users_task(feed, db):
 
 
 # --------------------------------------------------------------------- rendering
-def test_users_text_and_keyboard_depend_on_status(db):
+def test_users_text_is_numbered_and_escapes_names(db):
     db.ensure_chat(CHAT)
     db.request_access(1, "<Pat>")
     db.ensure_chat(2)
-    db.set_status(3, "revoked")
     users = db.list_users()
 
     text = users_text(users, CHAT)
-    assert "&lt;Pat&gt;" in text and "👑" in text
 
-    labels = [b.text for b in _buttons(users_keyboard(users, CHAT))]
-    assert any("Revoke" in t for t in labels)  # chat 2, approved
-    assert any("Re-approve" in t for t in labels)  # chat 3, revoked
-    assert "❌ Deny" in labels  # chat 1, pending
-    assert not any(str(CHAT) in b.callback_data for b in _buttons(users_keyboard(users, CHAT)))
+    # Rows are ordered by chat id (the table's primary key): 1, 2, then the admin (CHAT).
+    assert "1. ⏳ &lt;Pat&gt;" in text and "2. ✅" in text and "3. 👑" in text
+
+
+def test_manage_keyboard_offers_actions_that_fit_the_status(db):
+    db.request_access(1, "pending one")
+    db.ensure_chat(2)
+    db.set_status(3, "revoked")
+    db.set_status(4, "denied")
+    by_id = {u.chat_id: u for u in db.list_users()}
+
+    def labels(chat_id):
+        return [b.text for b in _buttons(manage_user_keyboard(by_id[chat_id]))]
+
+    assert labels(1) == ["✅ Approve", "❌ Deny", "✖ Cancel"]
+    assert labels(2) == ["🚫 Revoke", "✖ Cancel"]
+    assert labels(3) == ["↩️ Unban", "✖ Cancel"]
+    assert labels(4) == ["↩️ Unban", "✖ Cancel"]
+    # Unban re-approves; Cancel is the only button that is not about this user.
+    unban = _buttons(manage_user_keyboard(by_id[3]))[0]
+    assert AccessCB.unpack(unban.callback_data) == AccessCB(action="approve", chat_id=3)
+
+
+# ------------------------------------------- /users: pick a number, then act (FSM)
+class Session:
+    """One dispatcher kept alive across updates, so FSM state survives between them."""
+
+    def __init__(self, db, config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from aiogram import Bot, Dispatcher
+        from aiogram.fsm.storage.memory import MemoryStorage
+
+        import handlers
+
+        self.dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
+        self.dp.include_router(handlers.build_router(config))
+        self.bot = Bot("123:abc")
+        self.bot.session.make_request = AsyncMock(return_value=MagicMock())
+        self.n = 0
+
+    def _calls(self, name):
+        return [
+            c.args[1]
+            for c in self.bot.session.make_request.await_args_list
+            if type(c.args[1]).__name__ == name
+        ]
+
+    async def send(self, chat_id, text=None, *, data=None):
+        from aiogram.types import CallbackQuery, Chat, Message, Update, User
+
+        from tests.conftest import NOW
+
+        self.n += 1
+        self.bot.session.make_request.reset_mock()
+        user = User(id=chat_id, is_bot=False, first_name="T")
+        message = Message(
+            message_id=self.n, date=NOW, chat=Chat(id=chat_id, type="private"),
+            from_user=user, text=None if data else text,
+        )
+        if data:
+            update = Update(update_id=self.n, callback_query=CallbackQuery(
+                id=str(self.n), from_user=user, chat_instance="x", data=data, message=message))
+        else:
+            update = Update(update_id=self.n, message=message)
+        await self.dp.feed_update(self.bot, update)
+        return self
+
+    def sent(self, chat_id):
+        return [m for m in self._calls("SendMessage") if m.chat_id == chat_id]
+
+    def edits(self):
+        return self._calls("EditMessageText")
+
+
+def _two_users(db):
+    db.ensure_chat(CHAT)
+    db.request_access(STRANGER, "alice")  # pending, number 2
+    db.ensure_chat(777)
+    db.set_status(777, "revoked")  # number 3
+
+
+async def test_users_lists_numbers_without_action_buttons(db, config):
+    _two_users(db)
+    s = Session(db, config)
+
+    await s.send(CHAT, "/users")
+
+    [msg] = s.sent(CHAT)
+    assert "1. 👑" in msg.text and "2. ⏳ alice" in msg.text and "3. 🚫" in msg.text
+    assert "number" in msg.text
+    # No per-user buttons under the list - only Cancel.
+    assert [b.text for b in _buttons(msg.reply_markup)] == ["✖ Cancel"]
+
+
+async def test_admin_picks_number_then_unbans(db, config):
+    _two_users(db)
+    s = Session(db, config)
+    await s.send(CHAT, "/users")
+
+    await s.send(CHAT, "3")
+    [menu] = s.sent(CHAT)
+    assert "777" in menu.text and "revoked" in menu.text
+    assert [b.text for b in _buttons(menu.reply_markup)] == ["↩️ Unban", "✖ Cancel"]
+
+    await s.send(CHAT, data=AccessCB(action="approve", chat_id=777).pack())
+    assert db.get_status(777) == "approved"
+    assert "given access" in s.sent(777)[0].text
+    assert "approved" in s.edits()[0].text
+
+
+async def test_admin_picks_number_then_revokes(db, config):
+    _two_users(db)
+    db.set_status(STRANGER, "approved")
+    s = Session(db, config)
+    await s.send(CHAT, "/users")
+    await s.send(CHAT, "2")
+
+    await s.send(CHAT, data=AccessCB(action="revoke", chat_id=STRANGER).pack())
+
+    assert db.get_status(STRANGER) == "revoked"
+    assert "removed" in s.sent(STRANGER)[0].text
+
+
+async def test_cancel_button_leaves_everything_unchanged(db, config):
+    _two_users(db)
+    s = Session(db, config)
+    await s.send(CHAT, "/users")
+    await s.send(CHAT, "2")
+
+    await s.send(CHAT, data=AccessCB(action="cancel", chat_id=0).pack())
+
+    assert db.get_status(STRANGER) == "pending"
+    assert s.edits()[0].text == "Cancelled." and s.edits()[0].reply_markup is None
+    # Back to normal: a number typed now is not treated as a pick.
+    await s.send(CHAT, "2")
+    assert s.sent(CHAT) == []
+
+
+async def test_cancel_works_from_the_list_prompt_and_by_command(db, config):
+    _two_users(db)
+    s = Session(db, config)
+
+    await s.send(CHAT, "/users")
+    await s.send(CHAT, data=AccessCB(action="cancel", chat_id=0).pack())
+    await s.send(CHAT, "2")
+    assert s.sent(CHAT) == []  # state was cleared by the button
+
+    await s.send(CHAT, "/users")
+    await s.send(CHAT, "/cancel")
+    await s.send(CHAT, "2")
+    assert [m.text for m in s.sent(CHAT)] == []  # and by /cancel
+
+
+async def test_bad_numbers_keep_waiting_and_explain(db, config):
+    _two_users(db)
+    s = Session(db, config)
+    await s.send(CHAT, "/users")
+
+    for bad in ("0", "4", "-1", "alice", "1.5", "²"):
+        await s.send(CHAT, bad)
+        [reply] = s.sent(CHAT)
+        assert "from 1 to 3" in reply.text, bad
+
+    await s.send(CHAT, "1")  # the admin's own row
+    assert "That's you" in s.sent(CHAT)[0].text
+
+    await s.send(CHAT, "#2")  # still waiting: a valid pick works
+    assert "alice" in s.sent(CHAT)[0].text
+
+
+async def test_other_commands_abandon_the_pick(db, config):
+    _two_users(db)
+    s = Session(db, config)
+    await s.send(CHAT, "/users")
+    await s.send(CHAT, "/tasks")
+
+    await s.send(CHAT, "2")
+
+    assert s.sent(CHAT) == []
+
+
+async def test_only_the_admin_can_use_the_number_flow(db, config):
+    _two_users(db)
+    db.set_status(STRANGER, "approved")
+    s = Session(db, config)
+
+    await s.send(STRANGER, "/users")  # not admin: not handled
+    await s.send(STRANGER, "3")
+
+    assert s.sent(STRANGER) == []
+    assert db.get_status(777) == "revoked"

@@ -33,7 +33,7 @@ class TaskCB(CallbackData, prefix="task"):
 
 
 class AccessCB(CallbackData, prefix="acc"):
-    """Admin buttons for managing users. ``action``: approve | deny | revoke."""
+    """Admin buttons for managing users. ``action``: approve | deny | revoke | cancel."""
 
     action: str
     chat_id: int
@@ -63,38 +63,35 @@ def request_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def users_keyboard(users: Sequence[UserState], admin_chat_id: int) -> InlineKeyboardMarkup:
-    """One row of actions per non-admin user, depending on their status."""
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    """A lone Cancel button (under the numbered /users list)."""
     kb = InlineKeyboardBuilder()
-    for u in users:
-        if u.chat_id == admin_chat_id:
-            continue
-        label = _short(u.display_name or str(u.chat_id))
-        if u.status == "approved":
-            kb.row(
-                InlineKeyboardButton(
-                    text=f"🚫 Revoke {label}",
-                    callback_data=AccessCB(action="revoke", chat_id=u.chat_id).pack(),
-                )
-            )
-        elif u.status == "pending":
-            kb.row(
-                InlineKeyboardButton(
-                    text=f"✅ {label}",
-                    callback_data=AccessCB(action="approve", chat_id=u.chat_id).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="❌ Deny",
-                    callback_data=AccessCB(action="deny", chat_id=u.chat_id).pack(),
-                ),
-            )
-        else:  # denied / revoked
-            kb.row(
-                InlineKeyboardButton(
-                    text=f"↩️ Re-approve {label}",
-                    callback_data=AccessCB(action="approve", chat_id=u.chat_id).pack(),
-                )
-            )
+    kb.row(_cancel_button())
+    return kb.as_markup()
+
+
+def _cancel_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text="✖ Cancel", callback_data=AccessCB(action="cancel", chat_id=0).pack()
+    )
+
+
+def manage_user_keyboard(user: UserState) -> InlineKeyboardMarkup:
+    """Actions for the one user the admin picked, depending on their status."""
+    kb = InlineKeyboardBuilder()
+
+    def act(text: str, action: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=text, callback_data=AccessCB(action=action, chat_id=user.chat_id).pack()
+        )
+
+    if user.status == "approved":
+        kb.row(act("🚫 Revoke", "revoke"))
+    elif user.status == "pending":
+        kb.row(act("✅ Approve", "approve"), act("❌ Deny", "deny"))
+    else:  # denied / revoked
+        kb.row(act("↩️ Unban", "approve"))
+    kb.row(_cancel_button())
     return kb.as_markup()
 
 
