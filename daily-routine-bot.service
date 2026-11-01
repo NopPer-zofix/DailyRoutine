@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily Routine Telegram bot
+# Wait for the network so the first Telegram connection doesn't fail at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and the paths if you installed somewhere else
+User=pi
+WorkingDirectory=/home/pi/DailyRoutine
+ExecStart=/home/pi/DailyRoutine/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+# The bot handles SIGTERM itself (stops polling, scheduler, closes the DB)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

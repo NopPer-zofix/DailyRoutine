@@ -1,0 +1,6 @@
+aiogram>=3.13,<4
+APScheduler>=3.10,<4
+python-dotenv>=1.0
+tzlocal>=5.0
+# Windows has no system tz database; harmless elsewhere (only installed on Windows).
+tzdata>=2024.1; platform_system == "Windows"
