@@ -7,7 +7,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from database import Task
+from database import Task, UserState
 
 MAX_BUTTON_TITLE = 40
 
@@ -28,8 +28,64 @@ class TaskCB(CallbackData, prefix="task"):
     view: str = VIEW_LIST
 
 
+class AccessCB(CallbackData, prefix="acc"):
+    """Admin buttons for managing users. ``action``: approve | deny | revoke."""
+
+    action: str
+    chat_id: int
+
+
 def _short(title: str) -> str:
     return title if len(title) <= MAX_BUTTON_TITLE else title[: MAX_BUTTON_TITLE - 1] + "…"
+
+
+def request_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Approve / Deny buttons under an access request."""
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ Approve", callback_data=AccessCB(action="approve", chat_id=chat_id).pack()
+        ),
+        InlineKeyboardButton(
+            text="❌ Deny", callback_data=AccessCB(action="deny", chat_id=chat_id).pack()
+        ),
+    )
+    return kb.as_markup()
+
+
+def users_keyboard(users: Sequence[UserState], admin_chat_id: int) -> InlineKeyboardMarkup:
+    """One row of actions per non-admin user, depending on their status."""
+    kb = InlineKeyboardBuilder()
+    for u in users:
+        if u.chat_id == admin_chat_id:
+            continue
+        label = _short(u.display_name or str(u.chat_id))
+        if u.status == "approved":
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"🚫 Revoke {label}",
+                    callback_data=AccessCB(action="revoke", chat_id=u.chat_id).pack(),
+                )
+            )
+        elif u.status == "pending":
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"✅ {label}",
+                    callback_data=AccessCB(action="approve", chat_id=u.chat_id).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="❌ Deny",
+                    callback_data=AccessCB(action="deny", chat_id=u.chat_id).pack(),
+                ),
+            )
+        else:  # denied / revoked
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"↩️ Re-approve {label}",
+                    callback_data=AccessCB(action="approve", chat_id=u.chat_id).pack(),
+                )
+            )
+    return kb.as_markup()
 
 
 def tasks_keyboard(tasks: Sequence[Task]) -> InlineKeyboardMarkup:

@@ -5,7 +5,7 @@ from datetime import date
 from html import escape
 from typing import Sequence
 
-from database import Task
+from database import Task, UserState
 
 BAR_WIDTH = 10
 
@@ -14,11 +14,53 @@ HELP_TEXT = (
     "/tasks - today's checklist (tap a task to toggle it)\n"
     "/add &lt;text&gt; - add a task (or just /add and I'll ask)\n"
     "/delete - choose tasks to delete\n"
-    "/reminders - turn the 4-hour reminders on/off\n"
+    "/reminders - turn the periodic reminders on/off\n"
+    "/remind - send the reminder right now (preview)\n"
+    "/timezone &lt;Area/City&gt; - set your timezone, e.g. Europe/Berlin\n"
     "/help - this message\n\n"
-    "Every night at midnight (local time) a fresh list is generated. "
+    "Every night at midnight (your local time) a fresh list is generated. "
     "Every few hours I remind you about what is still open."
 )
+
+ADMIN_HELP_TEXT = (
+    "\n\n<b>Admin</b>\n"
+    "/users - see who has access; approve, deny or revoke"
+)
+
+
+def help_text(is_admin: bool) -> str:
+    return HELP_TEXT + (ADMIN_HELP_TEXT if is_admin else "")
+
+
+STATUS_ICONS = {"approved": "✅", "pending": "⏳", "denied": "❌", "revoked": "🚫"}
+
+
+def user_label(user: UserState) -> str:
+    return escape(user.display_name) if user.display_name else f"user {user.chat_id}"
+
+
+def users_text(users: Sequence[UserState], admin_chat_id: int) -> str:
+    """Admin overview of everybody the bot knows."""
+    lines = []
+    for u in users:
+        if u.chat_id == admin_chat_id:
+            lines.append("👑 <b>You</b> (admin)")
+            continue
+        tz = f" · {escape(u.timezone)}" if u.timezone else ""
+        lines.append(
+            f"{STATUS_ICONS.get(u.status, '•')} {user_label(u)} · <code>{u.chat_id}</code>"
+            f" · {u.status}{tz}"
+        )
+    return "👥 <b>Users</b>\n\n" + "\n".join(lines)
+
+
+def access_request_text(display_name: str, chat_id: int) -> str:
+    return (
+        "🔔 <b>Access request</b>\n"
+        f"{escape(display_name)} · <code>{chat_id}</code>\n\n"
+        "They can create their own private task list and reminders. "
+        "You cannot see their tasks."
+    )
 
 
 def progress_bar(done: int, total: int, width: int = BAR_WIDTH) -> str:

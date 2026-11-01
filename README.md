@@ -4,7 +4,10 @@ A personal Telegram bot for a Raspberry Pi that tracks today's routine tasks and
 nudges you every 4 hours about whatever is still open.
 
 - **Stack:** Python 3.10+, aiogram 3, APScheduler 3, SQLite, python-dotenv
-- **Single user:** only `ADMIN_CHAT_ID` can use it; updates from other chats are ignored.
+- **Invite-only, multi-user:** `ADMIN_CHAT_ID` is the owner and is always allowed. Anyone else who
+  messages the bot creates an *access request*; the admin gets **Approve / Deny** buttons. Approved
+  users each get their own private task list, reminders and timezone (the admin cannot see their
+  tasks). See [Access control](#access-control).
 
 ## Features
 
@@ -27,12 +30,13 @@ DailyRoutine/
 ├── handlers.py              # commands + inline-button callbacks (admin-only router)
 ├── keyboards.py             # inline keyboards + typed callback data
 ├── texts.py                 # message rendering (progress bar, reminder text)
-├── reminders.py             # 4-hour rule, scheduler jobs, retrying sender
+├── access.py                # middleware: admin / approved users in, strangers request access
+├── reminders.py             # 4-hour rule, per-user-timezone scheduler tick, retrying sender
 ├── daily-routine-bot.service# systemd unit
 ├── .env.example
 ├── requirements.txt / requirements-dev.txt
 ├── pytest.ini
-└── tests/                   # offline pytest suite (79 tests)
+└── tests/                   # offline pytest suite (113 tests)
 ```
 
 ## Database schema
@@ -136,7 +140,7 @@ sqlite3 data/routine.db ".backup 'routine-backup.db'"
 | Variable                                    | Default           | Meaning                                                                                |
 | ------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------- |
 | `BOT_TOKEN`                                 | - (required)      | Token from @BotFather                                                                  |
-| `ADMIN_CHAT_ID`                             | - (required)      | The only chat the bot serves / reminds                                                 |
+| `ADMIN_CHAT_ID`                             | - (required)      | The owner: always allowed, approves other users                                                 |
 | `TIMEZONE`                                  | system zone       | IANA name, e.g. `Europe/Berlin`                                                        |
 | `DB_PATH`                                   | `data/routine.db` | SQLite file                                                                            |
 | `REMINDER_INTERVAL_HOURS`                   | `4`               | Hours between checks                                                                   |
@@ -145,9 +149,28 @@ sqlite3 data/routine.db ".backup 'routine-backup.db'"
 | `SEND_CONGRATS`                             | `true`            | One 🎉 message when everything is done                                                 |
 | `LOG_LEVEL`                                 | `INFO`            |                                                                                        |
 
+## Access control
+
+| Who | What happens |
+|---|---|
+| Admin (`ADMIN_CHAT_ID`) | Always allowed. `/users` lists everyone with Approve / Deny / Revoke / Re-approve buttons. |
+| New person | Their first message creates a *pending* request and sends the admin a notification with ✅ Approve / ❌ Deny. They are told to wait. Nothing is stored except their name and chat id. |
+| Approved | Full use of the bot; own private list, reminders, timezone. |
+| Pending | Told "still waiting"; the admin is not notified again. |
+| Denied / revoked | Ignored silently. The admin can re-approve from `/users`; a revoked user's tasks are kept. |
+
+Notes:
+* Only **private** chats are served for non-admins; groups are ignored.
+* At most 20 requests can be pending at once, so a stranger cannot flood you.
+* Each user's timezone defaults to the Pi's. They change it with `/timezone Europe/Berlin`;
+  midnight rollover and reminder hours (`REMINDER_*`, the same for everybody) follow it.
+  The scheduler wakes every 15 minutes and checks each user's local clock.
+* Upgrading from the single-user version is automatic: on first start the database gets the new
+  columns and the existing chat stays approved. No manual steps.
+
 ## Bot commands
 
-`/tasks` · `/add <text>` · `/delete` · `/reminders` (toggle on/off) · `/cancel` · `/help`
+`/tasks` · `/add <text>` · `/delete` · `/reminders` (toggle on/off) · `/remind` (send the reminder now - a preview that ignores the schedule and changes no state) · `/timezone <Area/City>` · `/cancel` · `/help` · admin only: `/users`
 
 ## Tests
 

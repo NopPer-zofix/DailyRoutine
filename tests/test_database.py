@@ -192,3 +192,83 @@ def test_list_chats(db: Database):
     db.ensure_chat(1)
     db.ensure_chat(1)  # idempotent
     assert db.list_chats() == [1, 2]
+
+
+# ----------------------------------------------------------------- access/status
+def test_internal_bookkeeping_never_grants_access(db: Database):
+    db.add_task(5, "x", TODAY)
+    db.get_state(6)
+    db.set_reminders_enabled(7, False)
+    db.set_timezone(8, "Asia/Tokyo")
+
+    assert [db.get_status(c) for c in (5, 6, 7, 8)] == ["pending"] * 4
+    assert db.list_chats() == []
+
+
+def test_ensure_chat_does_not_override_existing_status(db: Database):
+    db.set_status(5, "revoked")
+    db.ensure_chat(5)
+    assert db.get_status(5) == "revoked"
+
+
+def test_request_access_only_once(db: Database):
+    assert db.request_access(5, "Alice") is True
+    assert db.request_access(5, "Alice again") is False
+    assert db.get_state(5).display_name == "Alice"
+    assert db.pending_count() == 1
+
+    db.set_status(5, "denied")
+    assert db.request_access(5, "Alice") is False  # a denied user can't re-request
+    assert db.pending_count() == 0
+
+
+def test_set_status_rejects_unknown_value(db: Database):
+    with pytest.raises(ValueError):
+        db.set_status(5, "superuser")
+
+
+def test_only_approved_chats_are_listed(db: Database):
+    for chat, status in ((1, "approved"), (2, "pending"), (3, "denied"), (4, "revoked")):
+        db.ensure_chat(chat, status)
+    assert db.list_chats() == [1]
+    assert [u.chat_id for u in db.list_users()] == [1, 2, 3, 4]
+
+
+def test_timezone_roundtrip(db: Database):
+    db.set_timezone(5, "Asia/Tokyo")
+    assert db.get_state(5).timezone == "Asia/Tokyo"
+    db.set_timezone(5, None)
+    assert db.get_state(5).timezone is None
+
+
+def test_old_database_is_migrated_and_keeps_admin_approved(tmp_path):
+    """A DB from the single-user release (no status/timezone columns) must upgrade."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            title TEXT NOT NULL, task_date TEXT NOT NULL, is_done INTEGER NOT NULL DEFAULT 0,
+            completed_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE user_state (chat_id INTEGER PRIMARY KEY, last_rollover_date TEXT,
+            last_congrats_date TEXT, last_reminder_at TEXT,
+            reminders_enabled INTEGER NOT NULL DEFAULT 1);
+        INSERT INTO user_state (chat_id) VALUES (330122144);
+        INSERT INTO tasks (chat_id, title, task_date) VALUES (330122144, 'Gym', '2025-03-10');
+        """
+    )
+    old.commit()
+    old.close()
+
+    database = Database(path)
+    database.connect()
+    database.close()
+    database = Database(path)
+    database.connect()  # second start: migration must be idempotent
+
+    assert database.get_status(330122144) == "approved"
+    assert database.list_chats() == [330122144]
+    assert database.list_tasks(330122144, TODAY)[0].title == "Gym"
+    database.close()

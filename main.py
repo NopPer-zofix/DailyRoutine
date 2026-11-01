@@ -73,13 +73,16 @@ async def run(config: Config) -> None:
     """Start everything and block until SIGINT/SIGTERM, then shut down cleanly."""
     db = Database(config.db_path)
     db.connect()
-    db.ensure_chat(config.admin_chat_id)  # reminders work even before /start
+    # The admin is always approved (also repairs a row that was somehow revoked),
+    # so reminders work even before the first /start.
+    db.set_status(config.admin_chat_id, "approved")
 
     bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
     dp.include_router(build_router(config))
 
     service = ReminderService(bot, db, config)
+    dp["reminder_service"] = service  # injected into /remind
     scheduler = service.build_scheduler()
 
     stop = asyncio.Event()

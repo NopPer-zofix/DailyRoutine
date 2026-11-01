@@ -54,7 +54,8 @@ def test_reminder_hours_rejects_bad_interval():
 # --------------------------------------------------------------- service flow
 @pytest.fixture
 def service(bot, db, config) -> ReminderService:
-    return ReminderService(bot, db, config, now_fn=lambda: NOW)
+    db.ensure_chat(CHAT)  # approved, so tick() serves it
+    return ReminderService(bot, db, config, now_fn=lambda tz: NOW.astimezone(tz))
 
 
 async def test_open_tasks_trigger_reminder_with_buttons(service, bot, db):
@@ -94,6 +95,26 @@ async def test_no_message_when_reminders_disabled(service, bot, db):
     bot.send_message.assert_not_awaited()
 
 
+async def test_forced_reminder_ignores_off_switch_and_records_nothing(service, bot, db):
+    db.add_task(CHAT, "Gym", TODAY)
+    db.set_reminders_enabled(CHAT, False)
+
+    assert await service.process_chat(CHAT, force=True) is ReminderAction.REMIND
+
+    bot.send_message.assert_awaited_once()
+    assert db.get_state(CHAT).last_reminder_at is None  # preview leaves no trace
+
+
+async def test_forced_preview_when_all_done_does_not_use_up_daily_congrats(service, bot, db):
+    task = db.add_task(CHAT, "Gym", TODAY)
+    db.toggle_task(CHAT, task.id, TODAY, NOW)
+
+    assert await service.process_chat(CHAT, force=True) is ReminderAction.CONGRATS
+    assert await service.process_chat(CHAT, force=True) is ReminderAction.CONGRATS  # repeatable
+    assert db.get_state(CHAT).last_congrats_date is None
+    assert await service.process_chat(CHAT) is ReminderAction.CONGRATS  # real one still fires
+
+
 async def test_failed_send_is_not_recorded(service, bot, db, monkeypatch):
     monkeypatch.setattr(reminders.asyncio, "sleep", AsyncMock())
     db.add_task(CHAT, "Gym", TODAY)
@@ -104,7 +125,7 @@ async def test_failed_send_is_not_recorded(service, bot, db, monkeypatch):
     assert db.get_state(CHAT).last_reminder_at is None  # will be retried next slot
 
 
-async def test_check_survives_one_chat_failing(service, bot, db):
+async def test_tick_survives_one_chat_failing(service, bot, db):
     db.ensure_chat(1)
     db.ensure_chat(2)
     db.add_task(2, "Gym", TODAY)
@@ -117,9 +138,72 @@ async def test_check_survives_one_chat_failing(service, bot, db):
         return await original(chat_id)
 
     service.process_chat = flaky  # type: ignore[method-assign]
-    await service.check_reminders()
+    await service.tick()
 
     assert bot.send_message.call_args.args[0] == 2
+
+
+# ------------------------------------------------- per-user timezones in tick()
+def _service_at(bot, db, config, moment):
+    return ReminderService(bot, db, config, now_fn=lambda tz: moment.astimezone(tz))
+
+
+async def test_tick_uses_each_users_local_hour(bot, db, config):
+    # 12:00 Berlin = 20:00 Tokyo (reminder hour) = 06:00 New York (not one).
+    for chat, tz in ((10, "Asia/Tokyo"), (11, "America/New_York"), (12, "Europe/Berlin")):
+        db.ensure_chat(chat)
+        db.set_timezone(chat, tz)
+        db.add_task(chat, "Gym", TODAY)
+
+    await _service_at(bot, db, config, NOW).tick()
+
+    assert sorted(c.args[0] for c in bot.send_message.call_args_list) == [10, 12]
+
+
+async def test_tick_only_acts_at_top_of_local_hour(bot, db, config):
+    db.ensure_chat(CHAT)
+    db.add_task(CHAT, "Gym", TODAY)
+
+    await _service_at(bot, db, config, NOW.replace(minute=15)).tick()
+    await _service_at(bot, db, config, NOW.replace(minute=45)).tick()
+    bot.send_message.assert_not_awaited()
+
+    await _service_at(bot, db, config, NOW.replace(minute=14)).tick()
+    bot.send_message.assert_awaited_once()
+
+
+async def test_tick_handles_half_hour_timezones(bot, db, config):
+    db.ensure_chat(CHAT)
+    db.set_timezone(CHAT, "Asia/Kolkata")  # UTC+5:30
+    db.add_task(CHAT, "Gym", TODAY)
+
+    # 12:00 Berlin = 16:30 Kolkata: not the top of its hour.
+    await _service_at(bot, db, config, NOW).tick()
+    bot.send_message.assert_not_awaited()
+    # 15:30 Berlin = 20:00 Kolkata: a reminder hour, on a UTC :30 tick.
+    await _service_at(bot, db, config, NOW.replace(hour=15, minute=30)).tick()
+    bot.send_message.assert_awaited_once()
+
+
+async def test_tick_rolls_over_at_users_local_midnight(bot, db, config):
+    # 12:00 Berlin on the 10th = 00:00 on the 11th in Auckland (UTC+13 in March).
+    db.ensure_chat(CHAT)
+    db.set_timezone(CHAT, "Pacific/Auckland")
+    db.add_task(CHAT, "Gym", TODAY)
+
+    await _service_at(bot, db, config, NOW).tick()
+
+    assert [t.title for t in db.list_tasks(CHAT, TODAY.replace(day=11))] == ["Gym"]
+    bot.send_message.assert_not_awaited()  # hour 0 is not a reminder hour
+
+
+async def test_unapproved_chats_get_no_reminders(bot, db, config):
+    db.add_task(77, "Gym", TODAY)  # row exists, but only as 'pending'
+    db.set_status(78, "revoked")
+
+    await _service_at(bot, db, config, NOW).tick()
+
+    bot.send_message.assert_not_awaited()
 
 
 async def test_first_check_of_new_day_rolls_tasks_over(service, bot, db):
@@ -131,7 +215,8 @@ async def test_first_check_of_new_day_rolls_tasks_over(service, bot, db):
     bot.send_message.assert_awaited_once()  # fresh, unfinished list -> reminder
 
 
-async def test_midnight_rollover_all_chats(service, db):
+async def test_startup_rollover_all_chats(service, db):
+    db.ensure_chat(7)
     db.add_task(CHAT, "Gym", TODAY - timedelta(days=1))
     db.add_task(7, "Run", TODAY - timedelta(days=1))
 
@@ -142,16 +227,14 @@ async def test_midnight_rollover_all_chats(service, db):
 
 
 # ------------------------------------------------------------------ scheduler
-def test_scheduler_has_midnight_and_four_hour_jobs(service, config):
+def test_scheduler_has_one_quarter_hour_tick(service):
     scheduler = service.build_scheduler()
     jobs = {j.id: j for j in scheduler.get_jobs()}  # works before start()
-    triggers = {job_id: str(job.trigger) for job_id, job in jobs.items()}
 
-    assert set(triggers) == {"midnight_rollover", "reminder_check"}
-    assert "hour='0'" in triggers["midnight_rollover"]
-    assert "hour='8,12,16,20'" in triggers["reminder_check"]
-    # Local timezone, not UTC.
-    assert jobs["reminder_check"].trigger.timezone == config.tz
+    assert set(jobs) == {"tick"}
+    assert "*/15" in str(jobs["tick"].trigger)
+    # The 4-hour rule: reminder hours come from config, evaluated per user's local clock.
+    assert service.hours == [8, 12, 16, 20]
 
 
 # --------------------------------------------------------------- send retries

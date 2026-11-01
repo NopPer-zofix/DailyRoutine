@@ -5,14 +5,11 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import handlers
-from aiogram import Bot, Dispatcher
-from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandObject
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Chat, Message, Update, User
 from handlers import AddTask
 from keyboards import VIEW_REMINDER, TaskCB
+from reminders import ReminderAction
 from tests.conftest import CHAT, NOW, TODAY
 
 
@@ -86,6 +83,31 @@ async def test_first_use_of_new_day_rolls_over(make_message, fsm, db, config):
     assert [t.title for t in db.list_tasks(CHAT, TODAY)] == ["Gym"]
 
 
+async def test_timezone_command_validates_and_stores(make_message, fsm, db, config):
+    msg = make_message()
+
+    await handlers.cmd_timezone(msg, CommandObject(prefix="/", command="timezone", args="Mars/Base"), fsm, db, config)
+    assert db.get_state(CHAT).timezone is None
+    assert "don't know" in msg.answer.call_args.args[0]
+
+    await handlers.cmd_timezone(msg, CommandObject(prefix="/", command="timezone", args=" Asia/Tokyo "), fsm, db, config)
+    assert db.get_state(CHAT).timezone == "Asia/Tokyo"
+
+    await handlers.cmd_timezone(msg, CommandObject(prefix="/", command="timezone", args=None), fsm, db, config)
+    assert "Asia/Tokyo" in msg.answer.call_args.args[0]
+
+
+async def test_user_timezone_decides_which_day_it_is(make_message, fsm, db, config):
+    # NOW is 2025-03-10 12:00 Berlin = 2025-03-11 01:00 in Auckland.
+    db.set_timezone(CHAT, "Pacific/Auckland")
+    msg = make_message()
+
+    await handlers.cmd_add(msg, _command("Run"), fsm, db, config)
+
+    assert [t.title for t in db.list_tasks(CHAT, TODAY.replace(day=11))] == ["Run"]
+    assert db.list_tasks(CHAT, TODAY) == []
+
+
 async def test_reminders_command_toggles(make_message, fsm, db):
     msg = make_message()
 
@@ -93,6 +115,27 @@ async def test_reminders_command_toggles(make_message, fsm, db):
     assert db.get_state(CHAT).reminders_enabled is False
     await handlers.cmd_reminders(msg, fsm, db)
     assert db.get_state(CHAT).reminders_enabled is True
+
+
+async def test_remind_command_forces_reminder(make_message, fsm):
+    service = MagicMock()
+    service.process_chat = AsyncMock(return_value=ReminderAction.REMIND)
+    msg = make_message()
+
+    await handlers.cmd_remind(msg, fsm, service)
+
+    service.process_chat.assert_awaited_once_with(CHAT, force=True)
+    msg.answer.assert_not_awaited()  # the reminder itself is sent by the service
+
+
+async def test_remind_command_explains_when_there_are_no_tasks(make_message, fsm):
+    service = MagicMock()
+    service.process_chat = AsyncMock(return_value=ReminderAction.NONE)
+    msg = make_message()
+
+    await handlers.cmd_remind(msg, fsm, service)
+
+    assert "nothing to remind" in msg.answer.call_args.args[0]
 
 
 # ------------------------------------------------------------------ callbacks
@@ -173,40 +216,3 @@ async def test_add_button_enters_waiting_state(make_callback, fsm):
     cb.message.answer.assert_awaited_once()
 
 
-# ------------------------------------------------------------------- security
-def _update(chat_id: int, text: str) -> Update:
-    return Update(
-        update_id=1,
-        message=Message(
-            message_id=1,
-            date=NOW,
-            chat=Chat(id=chat_id, type="private"),
-            from_user=User(id=chat_id, is_bot=False, first_name="T"),
-            text=text,
-        ),
-    )
-
-
-async def _feed(config, db, chat_id: int):
-    """Push a real Update through a real Dispatcher; the HTTP layer is mocked."""
-    dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
-    dp.include_router(handlers.build_router(config))
-    bot = Bot("123:abc")
-    bot.session.make_request = AsyncMock(return_value=MagicMock())  # no network
-    result = await dp.feed_update(bot, _update(chat_id, "/tasks"))
-    return result, bot
-
-
-async def test_admin_chat_is_served(db, config):
-    result, bot = await _feed(config, db, CHAT)
-
-    assert result is not UNHANDLED
-    bot.session.make_request.assert_awaited()  # the dashboard was sent
-
-
-async def test_other_chats_are_ignored(db, config):
-    result, bot = await _feed(config, db, CHAT + 1)
-
-    assert result is UNHANDLED
-    bot.session.make_request.assert_not_awaited()
-    assert db.list_chats() == []  # a stranger can't even register a chat

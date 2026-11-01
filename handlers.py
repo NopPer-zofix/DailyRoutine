@@ -7,31 +7,37 @@ them trivial to call directly with mocks in tests.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, tzinfo
+from html import escape
 from typing import Optional, Tuple
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
-from config import Config
+from access import AccessMiddleware
+from config import Config, parse_timezone, resolve_timezone
 from database import Database
 from keyboards import (
     VIEW_REMINDER,
+    AccessCB,
     TaskCB,
     delete_keyboard,
     reminder_keyboard,
     tasks_keyboard,
+    users_keyboard,
 )
+from reminders import ReminderAction, ReminderService, send_with_retry
 from texts import (
-    HELP_TEXT,
     congrats_text,
     dashboard_text,
     delete_text,
+    help_text,
     reminder_text,
+    users_text,
 )
 
 log = logging.getLogger(__name__)
@@ -44,9 +50,14 @@ class AddTask(StatesGroup):
 
 
 # --------------------------------------------------------------------- helpers
-def local_now(config: Config) -> datetime:
-    """Timezone-aware current time in the configured local zone."""
-    return datetime.now(config.tz)
+def local_now(tz: tzinfo) -> datetime:
+    """Timezone-aware current time in ``tz``."""
+    return datetime.now(tz)
+
+
+def tz_for(db: Database, config: Config, chat_id: int) -> tzinfo:
+    """The user's own timezone, or the server default if they never set one."""
+    return resolve_timezone(db.get_state(chat_id).timezone, config.tz)
 
 
 def prepare_today(db: Database, config: Config, chat_id: int) -> Tuple[datetime, date]:
@@ -55,7 +66,7 @@ def prepare_today(db: Database, config: Config, chat_id: int) -> Tuple[datetime,
     Rolling over lazily here means the bot is correct on the first interaction
     of a new day even if the midnight job has not run (e.g. the Pi was off).
     """
-    now = local_now(config)
+    now = local_now(tz_for(db, config, chat_id))
     db.roll_over(chat_id, now.date(), config.rollover_mode)
     return now, now.date()
 
@@ -100,15 +111,91 @@ async def safe_edit(
 # -------------------------------------------------------------------- commands
 async def cmd_start(message: Message, state: FSMContext, db: Database, config: Config) -> None:
     await state.clear()
-    db.ensure_chat(message.chat.id)
-    await message.answer(HELP_TEXT)
+    await message.answer(help_text(message.chat.id == config.admin_chat_id))
     text, markup = render_list(db, config, message.chat.id)
     await message.answer(text, reply_markup=markup)
 
 
-async def cmd_help(message: Message, state: FSMContext) -> None:
+async def cmd_help(message: Message, state: FSMContext, config: Config) -> None:
     await state.clear()
-    await message.answer(HELP_TEXT)
+    await message.answer(help_text(message.chat.id == config.admin_chat_id))
+
+
+async def cmd_timezone(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    db: Database,
+    config: Config,
+) -> None:
+    """``/timezone Europe/Berlin`` - midnight and reminders follow this zone."""
+    await state.clear()
+    if not command.args:
+        tz = tz_for(db, config, message.chat.id)
+        await message.answer(
+            f"🕒 Your timezone is <b>{escape(str(tz))}</b> "
+            f"(local time {local_now(tz):%H:%M}).\n"
+            "Change it with /timezone &lt;Area/City&gt;, e.g. <code>/timezone Europe/Berlin</code>."
+        )
+        return
+    try:
+        tz = parse_timezone(command.args)
+    except ValueError:
+        await message.answer(
+            "⚠️ I don't know that timezone. Use an IANA name like "
+            "<code>Europe/Berlin</code> or <code>America/New_York</code>."
+        )
+        return
+    db.set_timezone(message.chat.id, tz.key)
+    await message.answer(
+        f"✅ Timezone set to <b>{escape(tz.key)}</b> (local time {local_now(tz):%H:%M})."
+    )
+
+
+# ---------------------------------------------------------------------- admin
+def render_users(db: Database, config: Config) -> Tuple[str, InlineKeyboardMarkup]:
+    users = db.list_users()
+    return users_text(users, config.admin_chat_id), users_keyboard(users, config.admin_chat_id)
+
+
+async def cmd_users(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    await state.clear()
+    text, markup = render_users(db, config)
+    await message.answer(text, reply_markup=markup)
+
+
+_ACCESS_ACTIONS = {"approve": "approved", "deny": "denied", "revoke": "revoked"}
+_ACCESS_NOTICES = {
+    "approve": "✅ You've been given access. Send /start to begin.",
+    "deny": "Sorry, your access request was declined.",
+    "revoke": "Your access to this bot has been removed.",
+}
+
+
+async def cb_access(
+    callback: CallbackQuery,
+    callback_data: AccessCB,
+    bot: Bot,
+    db: Database,
+    config: Config,
+) -> None:
+    """Admin pressed Approve / Deny / Revoke."""
+    target = callback_data.chat_id
+    new_status = _ACCESS_ACTIONS.get(callback_data.action)
+    previous = db.get_status(target)
+    if new_status is None or previous is None or target == config.admin_chat_id:
+        await callback.answer("Nothing to do.")
+        return
+
+    if previous != new_status:
+        db.set_status(target, new_status)
+        log.info("Access for %s: %s -> %s", target, previous, new_status)
+        await send_with_retry(bot, target, _ACCESS_NOTICES[callback_data.action])
+    await callback.answer(f"{new_status.capitalize()}.")
+
+    if isinstance(callback.message, Message):
+        text, markup = render_users(db, config)
+        await safe_edit(callback.message, text, markup)
 
 
 async def cmd_tasks(message: Message, state: FSMContext, db: Database, config: Config) -> None:
@@ -172,6 +259,18 @@ async def cmd_reminders(message: Message, state: FSMContext, db: Database) -> No
     await message.answer("🔔 Reminders are ON." if enabled else "🔕 Reminders are OFF.")
 
 
+async def cmd_remind(
+    message: Message, state: FSMContext, reminder_service: ReminderService
+) -> None:
+    """Send the scheduled reminder right now (preview; changes no state)."""
+    await state.clear()
+    action = await reminder_service.process_chat(message.chat.id, force=True)
+    if action is ReminderAction.NONE:
+        await message.answer("No tasks today - nothing to remind about. Add one with /add.")
+    elif action is ReminderAction.CONGRATS:
+        await message.answer("<i>(All tasks are done, so this is the all-done message.)</i>")
+
+
 # ------------------------------------------------------------------- callbacks
 async def cb_toggle(
     callback: CallbackQuery, callback_data: TaskCB, db: Database, config: Config
@@ -233,21 +332,31 @@ async def cb_show_list(callback: CallbackQuery, db: Database, config: Config) ->
 
 # ---------------------------------------------------------------------- router
 def build_router(config: Config) -> Router:
-    """Create the router, locked to the admin chat.
+    """Create the router.
 
-    Anything from another chat is silently ignored: this is a personal bot.
+    :class:`AccessMiddleware` lets through only the admin and approved users;
+    strangers trigger an access request instead (see ``access.py``).
     """
     router = Router(name="routine")
-    router.message.filter(F.chat.id == config.admin_chat_id)
-    router.callback_query.filter(F.message.chat.id == config.admin_chat_id)
+    access = AccessMiddleware(config.admin_chat_id)
+    router.message.outer_middleware(access)
+    router.callback_query.outer_middleware(access)
+
+    is_admin_msg = F.chat.id == config.admin_chat_id
+    is_admin_cb = F.message.chat.id == config.admin_chat_id
+
+    router.message.register(cmd_users, Command("users"), is_admin_msg)
+    router.callback_query.register(cb_access, AccessCB.filter(), is_admin_cb)
 
     router.message.register(cmd_start, CommandStart())
+    router.message.register(cmd_timezone, Command("timezone"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_tasks, Command("tasks", "list"))
     router.message.register(cmd_add, Command("add"))
     router.message.register(cmd_cancel, Command("cancel"))
     router.message.register(cmd_delete, Command("delete"))
     router.message.register(cmd_reminders, Command("reminders"))
+    router.message.register(cmd_remind, Command("remind"))
     router.message.register(add_title, AddTask.waiting_for_title, F.text, ~F.text.startswith("/"))
 
     router.callback_query.register(cb_toggle, TaskCB.filter(F.action == "toggle"))

@@ -16,6 +16,17 @@ from typing import Iterator, List, Optional, Tuple, Union
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 MAX_TITLE_LENGTH = 200
+MAX_PENDING_REQUESTS = 20  # stops a flood of strangers from filling the DB / spamming the admin
+
+STATUSES = ("pending", "approved", "denied", "revoked")
+
+# Columns added after the first release. Rows that already exist were created
+# by the single admin, so they default to 'approved'.
+_MIGRATIONS = {
+    "status": "TEXT NOT NULL DEFAULT 'approved'",
+    "display_name": "TEXT",
+    "timezone": "TEXT",
+}
 
 
 @dataclass(frozen=True)
@@ -39,6 +50,9 @@ class UserState:
     last_congrats_date: Optional[date]
     last_reminder_at: Optional[datetime]
     reminders_enabled: bool
+    status: str = "approved"
+    timezone: Optional[str] = None
+    display_name: Optional[str] = None
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:
@@ -77,6 +91,14 @@ class Database:
         self._conn = sqlite3.connect(self._path, isolation_level=None)  # autocommit
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Upgrade a database created by an older version (idempotent)."""
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(user_state)")}
+        for column, ddl in _MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE user_state ADD COLUMN {column} {ddl}")
 
     def close(self) -> None:
         """Close the connection (safe to call twice)."""
@@ -103,20 +125,86 @@ class Database:
             self.conn.execute("COMMIT")
 
     # ------------------------------------------------------------------ chats
-    def ensure_chat(self, chat_id: int) -> None:
-        """Register a chat (idempotent)."""
+    def ensure_chat(self, chat_id: int, status: str = "approved") -> None:
+        """Register a chat with ``status`` if it is not known yet (idempotent).
+
+        Only trusted code (start-up, admin actions) should call this with the
+        default; it never changes the status of an existing row.
+        """
+        self._check_status(status)
         self.conn.execute(
-            "INSERT OR IGNORE INTO user_state (chat_id) VALUES (?)", (chat_id,)
+            "INSERT OR IGNORE INTO user_state (chat_id, status) VALUES (?, ?)",
+            (chat_id, status),
         )
 
+    def _touch(self, chat_id: int) -> None:
+        """Make sure a row exists for internal bookkeeping *without* granting access."""
+        self.ensure_chat(chat_id, "pending")
+
+    @staticmethod
+    def _check_status(status: str) -> None:
+        if status not in STATUSES:
+            raise ValueError(f"Unknown status {status!r}")
+
     def list_chats(self) -> List[int]:
-        """Return all registered chat ids."""
-        rows = self.conn.execute("SELECT chat_id FROM user_state ORDER BY chat_id")
+        """Return the chat ids that are allowed to use the bot (get reminders etc.)."""
+        rows = self.conn.execute(
+            "SELECT chat_id FROM user_state WHERE status = 'approved' ORDER BY chat_id"
+        )
         return [r["chat_id"] for r in rows]
 
+    # ----------------------------------------------------------------- access
+    def get_status(self, chat_id: int) -> Optional[str]:
+        """``pending`` / ``approved`` / ``denied`` / ``revoked``, or None if unknown."""
+        row = self.conn.execute(
+            "SELECT status FROM user_state WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row["status"] if row else None
+
+    def set_status(self, chat_id: int, status: str) -> None:
+        """Change a chat's access status (creates the row if needed)."""
+        self._check_status(status)
+        self._touch(chat_id)
+        self.conn.execute(
+            "UPDATE user_state SET status = ? WHERE chat_id = ?", (status, chat_id)
+        )
+
+    def pending_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM user_state WHERE status = 'pending'"
+        ).fetchone()
+        return int(row["n"])
+
+    def request_access(self, chat_id: int, display_name: str) -> bool:
+        """Record an access request from an unknown chat.
+
+        Returns:
+            True if a new pending request was created (the admin should be
+            notified); False if the chat was already known in any status.
+        """
+        if self.get_status(chat_id) is not None:
+            return False
+        self.conn.execute(
+            "INSERT INTO user_state (chat_id, status, display_name) VALUES (?, 'pending', ?)",
+            (chat_id, display_name),
+        )
+        return True
+
+    def list_users(self) -> List[UserState]:
+        """All known chats, newest requests last (for the admin's /users)."""
+        rows = self.conn.execute("SELECT chat_id FROM user_state ORDER BY rowid").fetchall()
+        return [self.get_state(r["chat_id"]) for r in rows]
+
+    def set_timezone(self, chat_id: int, name: Optional[str]) -> None:
+        """Store an IANA timezone name (None = use the server default)."""
+        self._touch(chat_id)
+        self.conn.execute(
+            "UPDATE user_state SET timezone = ? WHERE chat_id = ?", (name, chat_id)
+        )
+
     def get_state(self, chat_id: int) -> UserState:
-        """Return the chat's state, registering the chat if it is new."""
-        self.ensure_chat(chat_id)
+        """Return the chat's state (creating a non-approved row if it is new)."""
+        self._touch(chat_id)
         row = self.conn.execute(
             "SELECT * FROM user_state WHERE chat_id = ?", (chat_id,)
         ).fetchone()
@@ -130,10 +218,13 @@ class Database:
                 else None
             ),
             reminders_enabled=bool(row["reminders_enabled"]),
+            status=row["status"],
+            timezone=row["timezone"],
+            display_name=row["display_name"],
         )
 
     def set_reminders_enabled(self, chat_id: int, enabled: bool) -> None:
-        self.ensure_chat(chat_id)
+        self._touch(chat_id)
         self.conn.execute(
             "UPDATE user_state SET reminders_enabled = ? WHERE chat_id = ?",
             (int(enabled), chat_id),
@@ -141,7 +232,7 @@ class Database:
 
     def mark_reminded(self, chat_id: int, when: datetime) -> None:
         """Record that a reminder was sent at ``when``."""
-        self.ensure_chat(chat_id)
+        self._touch(chat_id)
         self.conn.execute(
             "UPDATE user_state SET last_reminder_at = ? WHERE chat_id = ?",
             (when.isoformat(), chat_id),
@@ -149,7 +240,7 @@ class Database:
 
     def mark_congratulated(self, chat_id: int, day: date) -> None:
         """Record that the "all done" message was sent for ``day``."""
-        self.ensure_chat(chat_id)
+        self._touch(chat_id)
         self.conn.execute(
             "UPDATE user_state SET last_congrats_date = ? WHERE chat_id = ?",
             (day.isoformat(), chat_id),
@@ -167,7 +258,7 @@ class Database:
             raise ValueError("Task title must not be empty")
         if len(title) > MAX_TITLE_LENGTH:
             raise ValueError(f"Task title must be at most {MAX_TITLE_LENGTH} characters")
-        self.ensure_chat(chat_id)
+        self._touch(chat_id)
         cur = self.conn.execute(
             "INSERT INTO tasks (chat_id, title, task_date) VALUES (?, ?, ?)",
             (chat_id, title, day.isoformat()),

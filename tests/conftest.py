@@ -8,9 +8,11 @@ from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from aiogram import Bot
-from aiogram.types import CallbackQuery, Message
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
+import handlers
 from config import Config
 from database import Database
 
@@ -86,5 +88,62 @@ def fixed_clock(monkeypatch):
     """Pin the handlers' notion of "now" so tests don't depend on the real date."""
     import handlers
 
-    monkeypatch.setattr(handlers, "local_now", lambda cfg: NOW)
+    monkeypatch.setattr(handlers, "local_now", lambda tz: NOW.astimezone(tz))
     return NOW
+
+
+class Fed:
+    """Result of pushing one update through a real Dispatcher."""
+
+    def __init__(self, result, bot) -> None:
+        self.result = result
+        self.bot = bot
+
+    def calls(self, method_name: str = "SendMessage") -> list:
+        """Telegram API methods that the bot tried to call (HTTP layer is mocked)."""
+        return [
+            c.args[1]
+            for c in self.bot.session.make_request.await_args_list
+            if type(c.args[1]).__name__ == method_name
+        ]
+
+    def texts_to(self, chat_id: int) -> list:
+        return [m.text for m in self.calls() if m.chat_id == chat_id]
+
+
+@pytest.fixture
+def feed(db, config):
+    """``await feed(chat_id, "/tasks")`` or ``await feed(chat_id, data="acc:...")``."""
+
+    async def _feed(
+        chat_id: int,
+        text: str = "/tasks",
+        *,
+        data: str = "",
+        chat_type: str = "private",
+        username: str = "",
+    ) -> Fed:
+        dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
+        dp.include_router(handlers.build_router(config))
+        bot = Bot("123:abc")
+        bot.session.make_request = AsyncMock(return_value=MagicMock())  # no network
+        user = User(id=chat_id, is_bot=False, first_name="Test", username=username or None)
+        message = Message(
+            message_id=1,
+            date=NOW,
+            chat=Chat(id=chat_id, type=chat_type),
+            from_user=user,
+            text=None if data else text,
+        )
+        if data:
+            update = Update(
+                update_id=1,
+                callback_query=CallbackQuery(
+                    id="1", from_user=user, chat_instance="x", data=data, message=message
+                ),
+            )
+        else:
+            update = Update(update_id=1, message=message)
+        return Fed(await dp.feed_update(bot, update), bot)
+
+    return _feed

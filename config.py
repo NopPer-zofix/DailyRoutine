@@ -61,6 +61,29 @@ def detect_local_timezone() -> tzinfo:
         return fallback
 
 
+def parse_timezone(name: str) -> ZoneInfo:
+    """Validate an IANA timezone name such as ``Europe/Berlin``.
+
+    Raises:
+        ValueError: If the name is unknown or malformed.
+    """
+    name = name.strip()
+    try:
+        return ZoneInfo(name)
+    except (ValueError, KeyError, OSError) as exc:  # ZoneInfoNotFoundError is a KeyError
+        raise ValueError(f"Unknown timezone {name!r}") from exc
+
+
+def resolve_timezone(name: Optional[str], default: tzinfo) -> tzinfo:
+    """A user's stored timezone, or ``default`` if unset / no longer valid."""
+    if not name:
+        return default
+    try:
+        return parse_timezone(name)
+    except ValueError:
+        return default
+
+
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 

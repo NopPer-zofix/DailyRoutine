@@ -17,9 +17,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_chat_date ON tasks (chat_id, task_date);
 
--- Per-chat bot state: what has been rolled over / announced already.
+-- One row per Telegram chat: access status, settings and bookkeeping.
+-- (Databases created by older versions are upgraded in database.py::_migrate.)
 CREATE TABLE IF NOT EXISTS user_state (
     chat_id             INTEGER PRIMARY KEY,
+    status              TEXT    NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'approved', 'denied', 'revoked')),
+    display_name        TEXT,                             -- shown to the admin in /users
+    timezone            TEXT,                             -- IANA name; NULL = server default
     last_rollover_date  TEXT,                             -- day tasks were last generated for
     last_congrats_date  TEXT,                             -- day the "all done" message was sent
     last_reminder_at    TEXT,                             -- ISO timestamp of the last reminder

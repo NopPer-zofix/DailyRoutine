@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, tzinfo
 from enum import Enum
 from typing import Callable, List, Optional
 
@@ -18,12 +18,14 @@ from aiogram.types import InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config import Config
+from config import Config, resolve_timezone
 from database import Database
 from keyboards import reminder_keyboard
 from texts import congrats_text, reminder_text
 
 log = logging.getLogger(__name__)
+
+TICK_MINUTES = 15  # scheduler resolution; see ReminderService.tick
 
 
 class ReminderAction(Enum):
@@ -107,7 +109,7 @@ class ReminderService:
         bot: Aiogram bot used to send messages.
         db: Open database.
         config: Application config (timezone, hours, rollover mode...).
-        now_fn: Clock returning a timezone-aware "now"; injectable for tests.
+        now_fn: ``tz -> aware datetime``; injectable clock for tests.
     """
 
     def __init__(
@@ -115,38 +117,65 @@ class ReminderService:
         bot: Bot,
         db: Database,
         config: Config,
-        now_fn: Optional[Callable[[], datetime]] = None,
+        now_fn: Optional[Callable[[tzinfo], datetime]] = None,
     ) -> None:
         self.bot = bot
         self.db = db
         self.config = config
-        self._now_fn = now_fn or (lambda: datetime.now(config.tz))
+        self._now_fn = now_fn or (lambda tz: datetime.now(tz))
+        self.hours = reminder_hours(
+            config.reminder_start_hour, config.reminder_end_hour, config.reminder_interval_hours
+        )
 
-    def now(self) -> datetime:
-        return self._now_fn()
+    def now(self, tz: tzinfo) -> datetime:
+        return self._now_fn(tz)
+
+    def tz_for(self, chat_id: int) -> tzinfo:
+        """The chat's own timezone, falling back to the server default."""
+        return resolve_timezone(self.db.get_state(chat_id).timezone, self.config.tz)
 
     # ------------------------------------------------------------------ jobs
     async def rollover_all(self) -> None:
-        """Generate today's tasks for every chat (midnight job + startup catch-up)."""
-        today = self.now().date()
+        """Generate today's tasks for every approved chat (startup catch-up)."""
         for chat_id in self.db.list_chats():
             try:
+                today = self.now(self.tz_for(chat_id)).date()
                 created = self.db.roll_over(chat_id, today, self.config.rollover_mode)
                 log.info("Rollover for chat %s -> %s: %d task(s)", chat_id, today, created)
             except Exception:
                 log.exception("Rollover failed for chat %s", chat_id)
 
-    async def check_reminders(self) -> None:
-        """Run the reminder rule for every chat."""
+    async def tick(self) -> None:
+        """Runs every 15 minutes and acts on each user's *own* local clock.
+
+        At the top of a local hour (minute < 15, i.e. the first tick of the
+        hour - every real timezone offset is a multiple of 15 minutes):
+
+        * local hour 0 -> roll the user's tasks over to the new day;
+        * local hour in the reminder hours -> apply the 4-hour rule.
+        """
         for chat_id in self.db.list_chats():
             try:
-                await self.process_chat(chat_id)
+                local = self.now(self.tz_for(chat_id))
+                if local.minute >= TICK_MINUTES:
+                    continue
+                if local.hour == 0:
+                    self.db.roll_over(chat_id, local.date(), self.config.rollover_mode)
+                if local.hour in self.hours:
+                    await self.process_chat(chat_id)
             except Exception:
-                log.exception("Reminder check failed for chat %s", chat_id)
+                log.exception("Scheduled check failed for chat %s", chat_id)
 
-    async def process_chat(self, chat_id: int) -> ReminderAction:
-        """Evaluate the 4-hour rule for one chat and act on it."""
-        now = self.now()
+    async def process_chat(self, chat_id: int, *, force: bool = False) -> ReminderAction:
+        """Evaluate the 4-hour rule for one chat and act on it.
+
+        Args:
+            chat_id: Chat to process.
+            force: Preview mode (``/remind``). Skips the on/off switch and the
+                once-per-day congratulation limit, and does not record anything
+                in the database, so it never affects the real schedule.
+        """
+        now = self.now(self.tz_for(chat_id))
         today = now.date()
         # Lazy rollover: guarantees a correct list even if the midnight job was missed.
         self.db.roll_over(chat_id, today, self.config.rollover_mode)
@@ -157,51 +186,42 @@ class ReminderService:
         action = decide_reminder(
             len(tasks),
             done,
-            reminders_enabled=state.reminders_enabled,
-            congratulated_today=state.last_congrats_date == today,
-            send_congrats=self.config.send_congrats,
+            reminders_enabled=True if force else state.reminders_enabled,
+            congratulated_today=False if force else state.last_congrats_date == today,
+            send_congrats=True if force else self.config.send_congrats,
         )
 
         if action is ReminderAction.REMIND:
             sent = await send_with_retry(
                 self.bot, chat_id, reminder_text(tasks), reminder_keyboard(tasks)
             )
-            if sent:
+            if sent and not force:
                 self.db.mark_reminded(chat_id, now)
         elif action is ReminderAction.CONGRATS:
             sent = await send_with_retry(self.bot, chat_id, congrats_text(len(tasks)))
-            if sent:
+            if sent and not force:
                 self.db.mark_congratulated(chat_id, today)
         return action
 
     # ------------------------------------------------------------- scheduler
     def build_scheduler(self) -> AsyncIOScheduler:
-        """Create (but do not start) the scheduler with both cron jobs.
+        """Create (but do not start) the scheduler with a single 15-minute tick.
 
-        Jobs use the configured *local* timezone, so "20:00" means 20:00 on the
-        wall clock of the Pi, not UTC. ``misfire_grace_time`` lets a job that
-        was delayed (e.g. by a brief outage) still run; ``coalesce`` collapses
-        a backlog into a single run.
+        One global tick (instead of fixed cron hours) lets every user have their
+        own timezone: :meth:`tick` decides per user whether their local clock
+        has just reached a reminder hour or midnight. ``coalesce`` collapses a
+        backlog into one run; the short grace time matches the 15-minute window
+        in which a tick is still considered "the top of the hour".
         """
-        cfg = self.config
-        hours = reminder_hours(
-            cfg.reminder_start_hour, cfg.reminder_end_hour, cfg.reminder_interval_hours
-        )
         scheduler = AsyncIOScheduler(
-            timezone=cfg.tz,
-            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 15 * 60},
+            timezone=timezone.utc,
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 5 * 60},
         )
         scheduler.add_job(
-            self.rollover_all,
-            CronTrigger(hour=0, minute=0, timezone=cfg.tz),
-            id="midnight_rollover",
+            self.tick,
+            CronTrigger(minute="*/15", timezone=timezone.utc),
+            id="tick",
             replace_existing=True,
         )
-        scheduler.add_job(
-            self.check_reminders,
-            CronTrigger(hour=",".join(map(str, hours)), minute=0, timezone=cfg.tz),
-            id="reminder_check",
-            replace_existing=True,
-        )
-        log.info("Reminder checks scheduled at local hours %s (%s)", hours, cfg.tz)
+        log.info("Reminder checks at local hours %s (per-user timezone)", self.hours)
         return scheduler
