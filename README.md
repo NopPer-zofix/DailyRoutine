@@ -3,18 +3,18 @@
 A personal Telegram bot for a Raspberry Pi that tracks today's routine tasks and
 nudges you every 4 hours about whatever is still open.
 
-* **Stack:** Python 3.10+, aiogram 3, APScheduler 3, SQLite, python-dotenv
-* **Single user:** only `ADMIN_CHAT_ID` can use it; updates from other chats are ignored.
+- **Stack:** Python 3.10+, aiogram 3, APScheduler 3, SQLite, python-dotenv
+- **Single user:** only `ADMIN_CHAT_ID` can use it; updates from other chats are ignored.
 
 ## Features
 
-| Area | Behaviour |
-|---|---|
-| Tasks | `/add <text>`, ➕ button, 🗑 delete mode, `/tasks` checklist |
-| UI | Tap a task to toggle ⬜ ↔ ✅; header shows `███░░░░░░░ 3/10 tasks completed (30%)` |
+| Area           | Behaviour                                                                                                                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tasks          | `/add <text>`, ➕ button, 🗑 delete mode, `/tasks` checklist                                                                                                                                                                                      |
+| UI             | Tap a task to toggle ⬜ ↔ ✅; header shows `███░░░░░░░ 3/10 tasks completed (30%)`                                                                                                                                                                |
 | Midnight reset | At 00:00 **local** time a fresh list is generated (`ROLLOVER_MODE=reset` copies every task as not-done; `carry` copies only unfinished ones). It also runs lazily on first use and at startup, so a Pi that was off at midnight is still correct. |
-| 4-hour rule | At 08:00, 12:00, 16:00, 20:00 (configurable) the bot checks completion. Open tasks → reminder with one-tap ✅ buttons. All done → no reminder, one short 🎉 message per day. |
-| Reliability | Local timezone, send retries with backoff, flood-wait handling, reconnecting polling loop, graceful SIGINT/SIGTERM shutdown. |
+| 4-hour rule    | At 08:00, 12:00, 16:00, 20:00 (configurable) the bot checks completion. Open tasks → reminder with one-tap ✅ buttons. All done → no reminder, one short 🎉 message per day.                                                                      |
+| Reliability    | Local timezone, send retries with backoff, flood-wait handling, reconnecting polling loop, graceful SIGINT/SIGTERM shutdown.                                                                                                                      |
 
 ## Project structure
 
@@ -133,17 +133,17 @@ sqlite3 data/routine.db ".backup 'routine-backup.db'"
 
 ## Configuration (`.env`)
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `BOT_TOKEN` | - (required) | Token from @BotFather |
-| `ADMIN_CHAT_ID` | - (required) | The only chat the bot serves / reminds |
-| `TIMEZONE` | system zone | IANA name, e.g. `Europe/Berlin` |
-| `DB_PATH` | `data/routine.db` | SQLite file |
-| `REMINDER_INTERVAL_HOURS` | `4` | Hours between checks |
-| `REMINDER_START_HOUR` / `REMINDER_END_HOUR` | `8` / `22` | Checks fire at start, start+N, ... ≤ end (local hours), so nothing wakes you at 4 a.m. |
-| `ROLLOVER_MODE` | `reset` | `reset` or `carry` (see above) |
-| `SEND_CONGRATS` | `true` | One 🎉 message when everything is done |
-| `LOG_LEVEL` | `INFO` | |
+| Variable                                    | Default           | Meaning                                                                                |
+| ------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------- |
+| `BOT_TOKEN`                                 | - (required)      | Token from @BotFather                                                                  |
+| `ADMIN_CHAT_ID`                             | - (required)      | The only chat the bot serves / reminds                                                 |
+| `TIMEZONE`                                  | system zone       | IANA name, e.g. `Europe/Berlin`                                                        |
+| `DB_PATH`                                   | `data/routine.db` | SQLite file                                                                            |
+| `REMINDER_INTERVAL_HOURS`                   | `4`               | Hours between checks                                                                   |
+| `REMINDER_START_HOUR` / `REMINDER_END_HOUR` | `8` / `22`        | Checks fire at start, start+N, ... ≤ end (local hours), so nothing wakes you at 4 a.m. |
+| `ROLLOVER_MODE`                             | `reset`           | `reset` or `carry` (see above)                                                         |
+| `SEND_CONGRATS`                             | `true`            | One 🎉 message when everything is done                                                 |
+| `LOG_LEVEL`                                 | `INFO`            |                                                                                        |
 
 ## Bot commands
 
@@ -161,17 +161,17 @@ with an `AsyncMock` `send_message`, and handler tests use mocked `Message` /
 `CallbackQuery` objects. A few tests push real `Update`s through a real
 `Dispatcher` with the HTTP layer mocked (to verify the admin-only filter).
 
-* `test_database.py` - toggling, deletion, scoping, daily rollover (reset/carry, idempotency, multi-day gaps)
-* `test_reminders.py` - the 4-hour rule, congratulate-once, scheduler hours/timezone, retry/backoff
-* `test_handlers.py` - commands, buttons, stale buttons, access control
-* `test_texts_keyboards_config.py` - rendering, 64-byte callback limit, config validation
+- `test_database.py` - toggling, deletion, scoping, daily rollover (reset/carry, idempotency, multi-day gaps)
+- `test_reminders.py` - the 4-hour rule, congratulate-once, scheduler hours/timezone, retry/backoff
+- `test_handlers.py` - commands, buttons, stale buttons, access control
+- `test_texts_keyboards_config.py` - rendering, 64-byte callback limit, config validation
 
 ## Design notes
 
-* **Why sync `sqlite3`?** One process, a few rows per day; calls take microseconds, so
+- **Why sync `sqlite3`?** One process, a few rows per day; calls take microseconds, so
   it avoids an extra dependency and keeps tests simple.
-* **Why fixed reminder hours instead of "every 4 hours from startup"?** Restarts would shift
+- **Why fixed reminder hours instead of "every 4 hours from startup"?** Restarts would shift
   the schedule and could ping you at night. Set `REMINDER_START_HOUR=0 REMINDER_END_HOUR=23`
   for a plain round-the-clock 4-hour cycle (00, 04, 08, ...).
-* **State lives in SQLite, not memory** - except the transient "waiting for task text" state
+- **State lives in SQLite, not memory** - except the transient "waiting for task text" state
   (aiogram `MemoryStorage`), which is simply lost on restart (send `/add` again).
