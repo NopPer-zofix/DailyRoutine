@@ -1,8 +1,8 @@
 [Unit]
 Description=Daily Routine Telegram bot
 # Wait for the network so the first Telegram connection doesn't fail at boot
-After=network-online.target
-Wants=network-online.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
